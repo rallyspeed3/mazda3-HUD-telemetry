@@ -1,0 +1,26 @@
+# ---- Python packages (pip install -r requirements.txt) ----
+pyserial>=3.5
+Pillow>=10.0
+numpy>=1.24
+
+# Windows only -- the `curses` module discover_ids.py uses isn't included
+# with Windows Python. pip automatically skips this line on Mac/Linux.
+windows-curses>=2.3; sys_platform == "win32"
+
+# ---- Everything below this line is NOT a pip package --------------------
+# pip can't install these -- they're separate installs. Full walkthrough
+# in docs/HARDWARE_SETUP.md, quick version here:
+#
+# 1. ffmpeg -- required by hud_overlay/render_overlay.py (it shells out to
+#    the `ffmpeg` command to encode the video). Download from
+#    https://ffmpeg.org/download.html and make sure it's on your system
+#    PATH (test with `ffmpeg -version` in a terminal). Not needed if you
+#    only want CSV logs, not rendered video.
+#
+# 2. Arduino IDE -- https://www.arduino.cc/en/software -- used to flash
+#    the .ino sketches in firmware/ onto the Arduino.
+#
+# 3. arduino-mcp2515 library (by autowp) -- the Arduino-side driver for
+#    the MCP2515 CAN controller chip. Install it from inside the Arduino
+#    IDE: Tools -> Manage Libraries -> search "mcp2515" -> install the
+#    one by autowp. Required to compile any sketch in firmware/.

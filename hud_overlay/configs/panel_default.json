@@ -1,0 +1,9 @@
+{
+  "throttle": {"col": "throttle", "min": 0, "max": 80},
+  "brake": {"col": "brake", "min": 0, "max": 10000},
+  "steering": {"col": "steering_deg", "invert": false, "max_display_deg": 540},
+  "speed": {"col": "speed", "unit": "MPH", "scale": 1.0},
+  "rpm": {"col": "rpm", "max": 7000, "shift": 6200, "segments": 20},
+  "gear": {"col": "gear"},
+  "layout": {"style": "panel", "anchor": "bottom-left", "margin": 48, "scale": 1.0, "panel_opacity": 0.55}
+}

@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+
+# Recordings and renders you make while using this toolkit
+*.csv
+*.mov
+*.mp4
+!examples/sample_drive_log.csv
+
+# Your own local notes -- not meant to be published
+docs/GITHUB_UPLOAD_GUIDE.md
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Arduino IDE
+build/
+*.hex
