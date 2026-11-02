@@ -6,6 +6,13 @@
 - An **MCP2515 CAN bus module** (the common cheap breakout board, usually
   sold with a TJA1050 transceiver already on it -- look for "MCP2515 CAN
   Bus Module" on Amazon/AliExpress, a few dollars each)
+  - **Check which crystal it uses -- this trips people up.** These boards
+    come with either an **8MHz** or a **16MHz** crystal (look for a small
+    silver can near the MCP2515 chip, usually printed "8.000" or
+    "16.000"). The firmware in this repo is set for **8MHz**, which is
+    what most of these boards ship with. If yours is 16MHz and you don't
+    change anything, you'll get **no data at all, with no error message**
+    -- see Troubleshooting below.
 - A way to tap into your car's **OBD2 port**: an OBD2-to-screw-terminal
   breakout cable, or an OBD2 extension cable you don't mind cutting open
   to access CAN-H (pin 6) and CAN-L (pin 14) and ground (pin 4 or 5).
@@ -81,3 +88,40 @@ Python tool.
 - **Mac**: run `ls /dev/tty.*` in a terminal -- look for something like
   `/dev/tty.usbserial-1420` or `/dev/tty.usbmodem1420`.
 - **Linux**: run `ls /dev/ttyUSB*` or `ls /dev/ttyACM*` in a terminal.
+
+## Troubleshooting
+
+**No data at all -- dashboard/log just sits empty, no errors:**
+
+- **Wrong crystal frequency (most common cause).** This repo's firmware
+  assumes an 8MHz crystal on the MCP2515 board (see the note in "What you
+  need" above). If your board is 16MHz, every sketch in `firmware/` will
+  silently receive nothing. Fix: open the `.ino` file you flashed, find
+  the line `mcp2515.setBitrate(CAN_500KBPS, MCP_8MHZ);`, change
+  `MCP_8MHZ` to `MCP_16MHZ`, and re-upload.
+- **CAN-H and CAN-L swapped.** Double-check against the wiring table
+  above -- an easy mix-up since both wires usually look identical.
+- **Car isn't actually on.** Most signals (and always `steering_deg`)
+  need the engine running, not just key-on. Try key-on-engine-running,
+  not just accessory mode.
+- **Loose OBD2 tap.** Reseat the breakout cable in the OBD2 port and
+  check your screw terminals are actually clamped on the wire, not just
+  resting against it.
+
+**Some data, but it looks like garbage or cuts in and out:**
+
+- **Flaky USB-serial chip at 1,000,000 baud.** The firmware intentionally
+  runs the serial link at 1Mbaud instead of the usual 115200 (see the
+  comment in `can_live.ino` for why). Most USB-serial chips handle this
+  fine, but some very cheap CH340 clones are unreliable at that speed.
+  Try a different USB cable first (cheap cables are a common culprit),
+  then a different Arduino/USB-serial adapter if that doesn't help.
+- **Wrong `--port`.** Re-check with the steps above -- it's easy to pick
+  a leftover COM port from a different device.
+
+**Arduino IDE won't compile the sketch:**
+
+- Almost always a missing library. Tools -> Manage Libraries -> search
+  "mcp2515" -> install the one **by autowp** (there are a few similarly
+  named libraries; this repo's firmware is written against that one
+  specifically).
