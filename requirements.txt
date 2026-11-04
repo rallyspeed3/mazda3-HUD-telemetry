@@ -18,9 +18,14 @@ windows-curses>=2.3; sys_platform == "win32"
 #    only want CSV logs, not rendered video.
 #
 # 2. Arduino IDE -- https://www.arduino.cc/en/software -- used to flash
-#    the .ino sketches in firmware/ onto the Arduino.
+#    any sketch in firmware/ onto either board.
 #
-# 3. arduino-mcp2515 library (by autowp) -- the Arduino-side driver for
-#    the MCP2515 CAN controller chip. Install it from inside the Arduino
-#    IDE: Tools -> Manage Libraries -> search "mcp2515" -> install the
-#    one by autowp. Required to compile any sketch in firmware/.
+# 3. If you're using an Arduino Uno + MCP2515: the arduino-mcp2515
+#    library (by autowp) -- Tools -> Manage Libraries -> search
+#    "mcp2515" -> install the one by autowp. Required to compile the
+#    non-esp32_-prefixed sketches in firmware/.
+#
+# 4. If you're using an ESP32-S3 board instead: the "esp32 by Espressif
+#    Systems" board package (Boards Manager, not Library Manager) --
+#    see docs/HARDWARE_SETUP.md. No extra CAN library needed on this
+#    board, the driver ships with the board package.

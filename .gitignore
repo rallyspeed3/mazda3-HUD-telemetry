@@ -8,6 +8,10 @@ __pycache__/
 *.mp4
 !examples/sample_drive_log.csv
 
+# Output from discover_dids.py -- your own car's scan results, not meant
+# to be published as-is (every car's module/DID layout differs)
+discover_dids_*.log
+
 # Your own local notes -- not meant to be published
 docs/GITHUB_UPLOAD_GUIDE.md
 

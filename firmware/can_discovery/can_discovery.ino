@@ -27,7 +27,7 @@ int table_count = 0;
 // docs/FINDINGS.md) -- skipped here so the grid only shows what's still
 // unknown on your car. Remove entries (or add your own finds) as you go.
 const uint16_t SKIP_IDS[] = {
-    0x201,  // accelerator pedal + RPM
+   0x201,  // accelerator pedal + RPM
     0x205,  // brake switch
     0x20F,  // brake force + speed
     0x228,  // drivetrain engaged (in gear + clutch out)

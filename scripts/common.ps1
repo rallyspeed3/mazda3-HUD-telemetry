@@ -1,8 +1,10 @@
 # Shared helpers, dot-sourced by the other scripts in this folder.
 # You don't run this one directly.
 
-function Resolve-ArduinoPort {
-    Write-Host "Looking for the Arduino..." -ForegroundColor Cyan
+function Resolve-BoardPort {
+    # Works for either board: Arduino Uno shows up as "Arduino" or
+    # "CH340"; the ESP32-S3's native USB shows up as "USB Serial Device".
+    Write-Host "Looking for your board..." -ForegroundColor Cyan
 
     $candidates = @(Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue |
         Where-Object {
@@ -10,7 +12,8 @@ function Resolve-ArduinoPort {
                 $_.Name -match 'Arduino' -or
                 $_.Name -match 'CH340' -or
                 $_.Name -match 'USB-SERIAL' -or
-                $_.Name -match 'USB Serial'
+                $_.Name -match 'USB Serial' -or
+                $_.Name -match 'ESP32'
             )
         })
 
@@ -27,7 +30,7 @@ function Resolve-ArduinoPort {
             Write-Host "  $($i + 1)) $p -- $($candidates[$i].Name)"
         }
         while ($true) {
-            $choice = Read-Host "Which one is the Arduino? (type the number)"
+            $choice = Read-Host "Which one is your board? (type the number)"
             $index = 0
             if ([int]::TryParse($choice, [ref]$index) -and $index -ge 1 -and $index -le $candidates.Count) {
                 return [regex]::Match($candidates[$index - 1].Name, 'COM\d+').Value
@@ -38,7 +41,8 @@ function Resolve-ArduinoPort {
 
     Write-Host "Couldn't auto-detect it." -ForegroundColor Yellow
     Write-Host "Open Device Manager -> Ports (COM & LPT) to find it -- look for" -ForegroundColor Yellow
-    Write-Host "something like 'USB-SERIAL CH340 (COM6)' or 'Arduino Uno (COM6)'." -ForegroundColor Yellow
+    Write-Host "something like 'USB-SERIAL CH340 (COM6)', 'Arduino Uno (COM6)'," -ForegroundColor Yellow
+    Write-Host "or 'USB Serial Device (COM6)' (ESP32-S3)." -ForegroundColor Yellow
     return (Read-Host "Type the COM port (e.g. COM6)").Trim()
 }
 
