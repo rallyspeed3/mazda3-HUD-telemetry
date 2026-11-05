@@ -123,6 +123,10 @@
       "wheel_rl",
       "wheel_rr"
     ],
+    "lock_cols": [
+      "wheel_fl",
+      "wheel_fr"
+    ],
     "slip": 0.25,
     "min_speed": 10,
     "max_throttle": 15,

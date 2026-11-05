@@ -120,8 +120,10 @@ limiter, an ABS lamp and steering wheel on the left, MPH in the middle,
 gear on the right, and a curved band of brake (red) / throttle (green)
 segments below.
 
-The ABS lamp lights when a wheel locks up: while you're off the throttle
-and above 10 mph, any wheel turning 25% slower than the fastest one counts.
+The ABS lamp lights when a front wheel locks up: while you're off the
+throttle and above 10 mph, a front wheel turning 25% slower than the fastest
+wheel counts. Rear lockups (handbrake turns) are ignored on purpose; the rears
+still count toward the reference speed, so locking both fronts is caught.
 It needs the `wheel_fl,wheel_fr,wheel_rl,wheel_rr` columns, which
 `tools/record_drive.py` now logs (older recordings just leave the lamp off).
 Thresholds are in the `abs` section of the config.

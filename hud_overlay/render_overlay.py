@@ -46,9 +46,11 @@ DEFAULT_CONFIG = {
     "speed": {"col": "speed", "unit": "MPH", "scale": 1.0},
     "rpm": {"col": "rpm", "max": 7000, "shift": 6200, "segments": 20},
     "gear": {"col": "gear", "max": 6},            # cluster gear tape runs R, N, 1..max
-    # ABS lamp: lit when any wheel is much slower than the fastest one (a lockup)
-    # while off the throttle, held on briefly so it doesn't flicker between samples
-    "abs": {"cols": ["wheel_fl", "wheel_fr", "wheel_rl", "wheel_rr"],
+    # ABS lamp: lit when a front wheel is much slower than the fastest wheel (a lockup)
+    # while off the throttle, held on briefly so it doesn't flicker between samples.
+    # "cols" set the reference speed; only "lock_cols" can light the lamp, so a
+    # handbrake locking the rears doesn't count.
+    "abs": {"cols": ["wheel_fl", "wheel_fr", "wheel_rl", "wheel_rr"], "lock_cols": ["wheel_fl", "wheel_fr"],
             "slip": 0.25, "min_speed": 10, "max_throttle": 15, "hold": 0.3},
     "layout": {
         "style": "panel",              # "panel" (box with big wheel), "strip" (thin full-width bar) or "cluster"
@@ -153,8 +155,10 @@ class Log:
             arr = np.array(vals, dtype=float)
             self.channels[key] = arr
 
-        # wheel lockup -> ABS lamp. Off-throttle only, so front-wheel spin (which
-        # makes the rears look "slow") doesn't read as a lockup.
+        # wheel lockup -> ABS lamp. Reference speed is the fastest of all wheels (and the
+        # car's speed), but only the lock_cols wheels (fronts) can light it, so handbrake
+        # turns don't. Off-throttle only, so one front spinning doesn't make the other
+        # look locked.
         self.lock_t = np.array([])
         self.locked = np.zeros(len(rows), dtype=bool)
         ac = cfg.get("abs", {})
@@ -167,7 +171,8 @@ class Log:
                     return np.nan
             wheels = np.array([[num(r, c_) for c_ in wcols] for r in rows], dtype=float)
             ref = np.nanmax(np.column_stack([wheels, self.channels.get("speed", np.full(len(rows), np.nan))]), axis=1)
-            slowest = np.nanmin(wheels, axis=1)
+            lcols = [c_ for c_ in ac.get("lock_cols", wcols) if c_ in wcols] or wcols
+            slowest = np.nanmin(wheels[:, [wcols.index(c_) for c_ in lcols]], axis=1)
             thr = self.channels.get("throttle", np.zeros(len(rows)))
             locked = ((ref >= float(ac.get("min_speed", 10)))
                       & (slowest <= ref * (1 - float(ac.get("slip", 0.25))))
