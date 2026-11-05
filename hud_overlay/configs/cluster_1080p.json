@@ -25,7 +25,8 @@
     "limiter": 6500
   },
   "gear": {
-    "col": "gear"
+    "col": "gear",
+    "max": 6
   },
   "font": "/System/Library/Fonts/Supplemental/Arial Rounded Bold.ttf",
   "layout": {
@@ -99,7 +100,9 @@
           40
         ]
       ]
-    ]
+    ],
+    "ghost_alpha": 24,
+    "gear_anim": 0.18
   },
   "colors": {
     "throttle": [

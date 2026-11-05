@@ -45,7 +45,7 @@ DEFAULT_CONFIG = {
     "steering": {"col": "steering_deg", "invert": False, "max_display_deg": 540},
     "speed": {"col": "speed", "unit": "MPH", "scale": 1.0},
     "rpm": {"col": "rpm", "max": 7000, "shift": 6200, "segments": 20},
-    "gear": {"col": "gear"},
+    "gear": {"col": "gear", "max": 6},            # cluster gear tape runs R, N, 1..max
     # ABS lamp: lit when any wheel is much slower than the fastest one (a lockup)
     # while off the throttle, held on briefly so it doesn't flicker between samples
     "abs": {"cols": ["wheel_fl", "wheel_fr", "wheel_rl", "wheel_rr"],
@@ -178,12 +178,28 @@ class Log:
             print("note: no wheel-speed columns in CSV; the ABS lamp will stay off", file=sys.stderr)
         self.abs_hold = float(ac.get("hold", 0.3))
 
+        # gear shifts (sample indices where the gear changes), for the cluster's tape animation
+        g = self.channels.get("gear")
+        self.gear_steps = np.nan_to_num(g, nan=0.0) if g is not None else None
+        self.shift_idx = (np.flatnonzero(np.diff(self.gear_steps)) + 1) if g is not None else np.array([], int)
+
     def abs_on(self, t):
         cur = np.searchsorted(self.t, t, side="right") - 1      # sample at/before t
         if 0 <= cur < len(self.locked) and self.locked[cur]:
             return True
         i = np.searchsorted(self.lock_t, t, side="right") - 1   # recent lockup: hold the lamp on
         return bool(i >= 0 and t - self.lock_t[i] <= self.abs_hold)
+
+    def last_shift(self, t):
+        """(gear before the most recent shift at/before t, seconds since that shift)."""
+        if self.gear_steps is None:
+            return None, math.inf
+        i = np.searchsorted(self.t, t, side="right") - 1
+        j = np.searchsorted(self.shift_idx, i, side="right") - 1
+        if i < 0 or j < 0:
+            return None, math.inf
+        k = self.shift_idx[j]
+        return float(self.gear_steps[k - 1]), t - self.t[k]
 
     def value(self, key, t, step=False):
         arr = self.channels.get(key)
@@ -459,7 +475,7 @@ class StripHUD:
 class ClusterHUD:
     """Game-style digital cluster. A navy body holds: a gradient RPM line that rises
     into a plateau over the speed box (blinks at the rev limiter), a long row box with
-    an ABS lamp + steering wheel on the left and the gear (previous gear ghosted) on
+    an ABS lamp + steering wheel on the left and the gear (neighbouring gears ghosted) on
     the right, a glossy speed box on top of the row, and a curved band of thin brake
     (red, grows left) / throttle (green, grows right) segments that sweeps up at the ends."""
 
@@ -471,13 +487,12 @@ class ClusterHUD:
         self.W, self.H = int(self.X(1150)), int(self.Y(445))
         f = self.f
         self.font_speed = load_font(font_path, int(136 * f))
-        self.font_gear = load_font(font_path, int(98 * f))
-        self.font_ghost = load_font(font_path, int(70 * f))
         self.font_unit = load_font(font_path, int(24 * f))
         self.font_small = load_font(font_path, int(22 * f))
         self.font_icon = load_font(font_path, int(16 * f))
         self.wheel_d = int(84 * f)
         self.wheel = make_wheel(self.wheel_d, cfg.get("wheel_image"))
+        self._font_path, self._gear_fonts = font_path, {}
         self.col = cfg["colors"]
         cc = cfg.get("cluster", {})
         self.outline = tuple(cc.get("outline", [190, 200, 218]))
@@ -610,8 +625,8 @@ class ClusterHUD:
         dr.rectangle([cx - uw / 2, self.Y(258), cx + uw / 2, self.Y(276)], fill=rgba(self.plate_top, int(255 * op)))
         self._centered(dr, cx, self.Y(265), unit, self.font_unit, (235, 238, 245, 255))
 
-        # dash before the ghosted previous gear
-        dr.line([self.X(815), self.Y(170), self.X(858), self.Y(170)], fill=rgba(self.outline, 70),
+        # dash before the gear tape
+        dr.line([self.X(800), self.Y(170), self.X(834), self.Y(170)], fill=rgba(self.outline, 70),
                 width=max(1, int(3 * f)))
         return base
 
@@ -688,13 +703,43 @@ class ClusterHUD:
         stxt = "--" if spd is None else f"{spd * float(c['speed'].get('scale', 1.0)):.0f}"
         self._centered(dr, self.X(586), self.Y(168), stxt, self.font_speed, txt)
 
-        # --- gear, with the next-lower gear ghosted to its left
-        gear = v["gear"]
-        gtxt = "N" if gear is None or gear == 0 else ("R" if gear < 0 else str(int(gear)))
-        self._centered(dr, self.X(957), self.Y(172), gtxt, self.font_gear, txt)
-        if gear is not None and gear >= 1:
-            prev = "N" if gear < 2 else str(int(gear) - 1)
-            self._centered(dr, self.X(890), self.Y(172), prev, self.font_ghost, rgba(self.col["text"], 16))
+        # --- gear tape (R, N, 1..max): current gear big in the middle, neighbours ghosted.
+        # On a shift the tape slides to the new gear, which grows and brightens as it arrives.
+        tape = ["R", "N"] + [str(g) for g in range(1, int(c["gear"].get("max", 6)) + 1)]
+
+        def slot(g):
+            name = "N" if g is None or g == 0 else ("R" if g < 0 else str(int(g)))
+            return tape.index(name) if name in tape else None
+
+        gi = slot(v["gear"])
+        pos = gi
+        prev, since = v.get("shift", (None, math.inf))
+        pi = slot(prev)
+        dur = float(c.get("cluster", {}).get("gear_anim", 0.18))
+        if gi is not None and pi is not None and since < dur:
+            u = 1 - (1 - since / dur) ** 3                 # ease-out cubic
+            pos = pi + (gi - pi) * u
+        if pos is not None:
+            ghost_a = int(c.get("cluster", {}).get("ghost_alpha", 24))
+            layer = Image.new("RGBA", (W, self.H), (0, 0, 0, 0))
+            ld = ImageDraw.Draw(layer)
+            for idx in range(max(0, int(pos) - 2), min(len(tape), int(pos) + 3)):
+                d = abs(idx - pos)
+                if d >= 1.6:
+                    continue
+                near = max(0.0, 1 - d)                    # 1 = centered, 0 = ghost slot
+                size = int((70 + 28 * near) * f)
+                if size not in self._gear_fonts:
+                    self._gear_fonts[size] = load_font(self._font_path, size)
+                alpha = ghost_a + (255 - ghost_a) * near ** 2
+                if d > 1:
+                    alpha = ghost_a * max(0.0, (1.6 - d) / 0.6)
+                self._centered(ld, self.X(940 + (idx - pos) * 72), self.Y(172), tape[idx],
+                               self._gear_fonts[size], rgba(self.col["text"], int(alpha)))
+            clip = Image.new("L", (W, self.H), 0)
+            ImageDraw.Draw(clip).rectangle(self.R(842, 94, 1056, 244), fill=255)
+            layer.putalpha(ImageChops.multiply(layer.getchannel("A"), clip))
+            img.alpha_composite(layer)
 
         # --- pedal segments: brake grows left from center, throttle grows right
         for key, side, color in (("brake", -1, self.col["brake"]), ("throttle", 1, self.col["throttle"])):
@@ -819,6 +864,7 @@ def main():
             "rpm": log.value("rpm", td),
             "gear": log.value("gear", td, step=True),
             "abs": log.abs_on(td),
+            "shift": log.last_shift(td),
         }
 
     def flash(i):
