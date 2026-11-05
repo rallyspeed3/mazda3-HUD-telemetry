@@ -29,12 +29,12 @@ const uint16_t SKIP_IDS[] = {
     0x205,  // brake switch
     0x20F,  // brake force + speed
     0x228,  // drivetrain engaged (in gear + clutch out)
-    0x231,  // gear position
-    0x433,  // reverse + handbrake
-    0x082,  // steering angle
-    0x4B0,  // per-wheel speed
+//    0x231,  // gear position
+//    0x433,  // reverse + handbrake
+//    0x082,  // steering angle
+//    0x4B0,  // per-wheel speed
 };
-const int NUM_SKIP_IDS = 8;
+const int NUM_SKIP_IDS = sizeof(SKIP_IDS) / sizeof(SKIP_IDS[0]);
 
 bool is_skipped(uint16_t id) {
     for (int i = 0; i < NUM_SKIP_IDS; i++) {
