@@ -113,6 +113,27 @@ python hud_overlay/render_overlay.py \
     --out sample_hud.mov
 ```
 
+### Digital cluster style
+
+A game-style cluster: gradient RPM line that blinks at the 6500 RPM rev
+limiter, an ABS lamp and steering wheel on the left, MPH in the middle,
+gear on the right, and a curved band of brake (red) / throttle (green)
+segments below.
+
+The ABS lamp lights when a wheel locks up: while you're off the throttle
+and above 10 mph, any wheel turning 25% slower than the fastest one counts.
+It needs the `wheel_fl,wheel_fr,wheel_rl,wheel_rr` columns, which
+`tools/record_drive.py` now logs (older recordings just leave the lamp off).
+Thresholds are in the `abs` section of the config.
+
+```bash
+python hud_overlay/render_overlay.py \
+    --csv my_drive.csv \
+    --config hud_overlay/configs/cluster_1080p.json \
+    --out my_drive_hud_cluster.mov
+```
+
+
 ### Vertical video (Instagram Reels/Stories)
 
 ```bash
@@ -121,6 +142,26 @@ python hud_overlay/render_overlay.py \
     --config hud_overlay/configs/vertical_reels.json \
     --width 1080 --height 1920 \
     --out my_drive_hud_vertical.mov
+```
+
+## What each overlay looks like
+
+One preview frame per config in `hud_overlay/configs/` (same data in each:
+58 mph, 3rd gear, 5,400 RPM, 62% throttle, wheel turned 22° left), so you
+can pick one before rendering a whole video.
+
+| `panel_default.json` | `horizontal_1080p.json` |
+|---|---|
+| ![panel_default](docs/overlays/panel_default.png) | ![horizontal_1080p](docs/overlays/horizontal_1080p.png) |
+| **`cluster_1080p.json`** | **`vertical_reels.json`** (1080x1920) |
+| ![cluster_1080p](docs/overlays/cluster_1080p.png) | <img src="docs/overlays/vertical_reels.png" width="240" alt="vertical_reels"> |
+
+To preview your own drive with any config, render a single frame:
+
+```bash
+python hud_overlay/render_overlay.py --csv my_drive.csv \
+    --config hud_overlay/configs/cluster_1080p.json \
+    --preview 12.5 --preview-out frame.png
 ```
 
 ## How the signals were found

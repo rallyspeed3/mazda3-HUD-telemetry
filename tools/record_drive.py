@@ -2,7 +2,8 @@
 """
 record_drive.py -- records a driving session straight to a CSV file in
 the format hud_overlay/render_overlay.py expects
-(time,throttle,brake,steering_deg,speed,rpm,gear,gear_raw).
+(time,throttle,brake,steering_deg,speed,rpm,gear,gear_raw,
+wheel_fl,wheel_fr,wheel_rl,wheel_rr).
 
 Pairs with firmware/can_live.ino. Start it before you drive, stop it
 (Ctrl+C) when you're done -- no need to watch the screen while moving.
@@ -19,6 +20,8 @@ Decode formulas (see docs/FINDINGS.md for the full writeup):
     brake:        0x20F bytes 0-1, raw-30000 clamped to 0
     speed:        0x20F bytes 2-3, (raw-10000)/100 km/h -> mph
     steering_deg: 0x082 bytes 2-3, signed16/10 deg
+    wheel_*:      0x4B0 bytes 0-7, FL/FR/RL/RR, same formula as speed (mph)
+                  -- the HUD uses these to light an ABS lamp on wheel lockup
     gear:         0x231 byte 0 via lookup table, overridden to -1
                   (reverse) when the 0x433 reverse bit is set
 """
@@ -66,6 +69,7 @@ def main():
     gear = 0
     gear_raw = 0x01
     reverse = False
+    wheel = [0.0, 0.0, 0.0, 0.0]
 
     print(f"Logging to {args.out} at {args.rate:.0f} Hz -- Ctrl+C to stop.")
     print("Drive your session now. No need to watch this screen while moving.\n")
@@ -76,7 +80,8 @@ def main():
     next_tick = t0
 
     with open(args.out, "w", newline="") as f:
-        f.write("time,throttle,brake,steering_deg,speed,rpm,gear,gear_raw\n")
+        f.write("time,throttle,brake,steering_deg,speed,rpm,gear,gear_raw,"
+                "wheel_fl,wheel_fr,wheel_rl,wheel_rr\n")
         try:
             while True:
                 deadline = next_tick
@@ -111,13 +116,17 @@ def main():
                         else:
                             unknown_gear_codes.add(gear_raw)
                             # keep last known gear rather than guessing
+                    elif can_id == "4B0" and len(data) >= 8:
+                        wheel = [round((((data[i] << 8) | data[i + 1]) - 10000) / 100.0 * KMH_TO_MPH, 1)
+                                 for i in (0, 2, 4, 6)]
                     elif can_id == "433" and len(data) >= 4:
                         reverse = bool(data[3] & 0x02)
 
                 display_gear = -1 if reverse else gear
                 now = next_tick - t0
                 f.write(f"{now:.3f},{throttle},{brake},{steering_deg},{speed},"
-                        f"{rpm},{display_gear},0x{gear_raw:02X}\n")
+                        f"{rpm},{display_gear},0x{gear_raw:02X},"
+                        f"{wheel[0]},{wheel[1]},{wheel[2]},{wheel[3]}\n")
                 rows += 1
                 if rows % int(args.rate) == 0:
                     f.flush()
