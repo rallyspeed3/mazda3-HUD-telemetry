@@ -74,7 +74,8 @@ String CANTask_StartRecording() {
     File f = FFat.open(name, FILE_WRITE);
     if (!f) return "";
 
-    f.print("time,throttle,brake,steering_deg,speed,rpm,gear,gear_raw\n");
+    f.print("time,throttle,brake,steering_deg,speed,rpm,gear,gear_raw,"
+            "wheel_fl,wheel_fr,wheel_rl,wheel_rr\n");
 
     g_logFile = f;
     g_logName = name;
@@ -184,10 +185,12 @@ static void canTaskLoop(void* pvParameters) {
             int display_gear = t.reverse ? -1 : t.gear;
             float row_time = (next_tick_ms - t0_ms) / 1000.0f;
 
-            char line[160];
-            snprintf(line, sizeof(line), "%.3f,%.1f,%u,%.1f,%.1f,%u,%d,0x%02X\n",
+            char line[200];
+            snprintf(line, sizeof(line),
+                      "%.3f,%.1f,%u,%.1f,%.1f,%u,%d,0x%02X,%.1f,%.1f,%.1f,%.1f\n",
                       row_time, t.throttle, (unsigned)t.brake, t.steering_deg,
-                      t.speed, (unsigned)t.rpm, display_gear, t.gear_raw);
+                      t.speed, (unsigned)t.rpm, display_gear, t.gear_raw,
+                      t.wheel_fl, t.wheel_fr, t.wheel_rl, t.wheel_rr);
             g_logFile.print(line);
             g_logRows++;
             if (g_logRows % (uint32_t)LOG_RATE_HZ == 0) {
