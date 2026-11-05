@@ -1,6 +1,8 @@
 #include "can_task.h"
 #include "driver/twai.h"
 #include "FFat.h"
+#include <time.h>
+#include <sys/time.h>
 
 static const gpio_num_t CAN_TX_PIN = GPIO_NUM_15;
 static const gpio_num_t CAN_RX_PIN = GPIO_NUM_16;
@@ -42,11 +44,54 @@ static File g_logFile;
 static String g_logName = "";
 static volatile uint32_t g_logRows = 0;
 static uint32_t g_nextLogId = 1;
+static bool g_wallClockSet = false;
+
+// ---- wall clock (set once, by whichever browser loads the page first) ----
+bool CANTask_SetWallClock(int year, int month, int day, int hour, int minute, int second) {
+    if (g_wallClockSet) return false;   // first one wins for this boot
+    if (year < 2000 || year > 2100) return false;   // obviously bogus -- ignore rather than lock in garbage
+
+    struct tm t = {};
+    t.tm_year = year - 1900;
+    t.tm_mon = month - 1;
+    t.tm_mday = day;
+    t.tm_hour = hour;
+    t.tm_min = minute;
+    t.tm_sec = second;
+    t.tm_isdst = -1;
+
+    time_t epoch = mktime(&t);
+    struct timeval tv = {epoch, 0};
+    settimeofday(&tv, nullptr);   // this is what makes time()/localtime() below report real wall-clock time
+
+    g_wallClockSet = true;
+    return true;
+}
+
+bool CANTask_HasWallClock() { return g_wallClockSet; }
 
 // ---- filename handling ----
-static String makeLogName(uint32_t id) {
+static bool isAllDigits(const String& s) {
+    if (s.length() == 0) return false;
+    for (size_t i = 0; i < s.length(); i++) {
+        if (!isDigit(s[i])) return false;
+    }
+    return true;
+}
+
+static String makeLogName(uint32_t fallbackId) {
+    if (g_wallClockSet) {
+        time_t now = time(nullptr);
+        struct tm t;
+        localtime_r(&now, &t);
+        char buf[32];
+        strftime(buf, sizeof(buf), "/log_%Y-%m-%d_%H-%M-%S.csv", &t);
+        if (!FFat.exists(buf)) return String(buf);
+        // Two recordings started in the same second -- vanishingly unlikely,
+        // but fall through to the numeric scheme below rather than overwrite.
+    }
     char buf[24];
-    snprintf(buf, sizeof(buf), "/log_%05u.csv", (unsigned)id);
+    snprintf(buf, sizeof(buf), "/log_%05u.csv", (unsigned)fallbackId);
     return String(buf);
 }
 
@@ -58,8 +103,14 @@ static void scanNextLogId() {
     while (f) {
         String name = f.name();                     // "log_00007.csv" (no leading '/')
         if (name.startsWith("log_") && name.endsWith(".csv")) {
-            uint32_t id = (uint32_t)name.substring(4, name.length() - 4).toInt();
-            if (id > maxId) maxId = id;
+            String mid = name.substring(4, name.length() - 4);
+            // Only the plain "log_NNNNN.csv" scheme counts here -- skip
+            // date-named logs ("log_2026-11-05_14-32-07.csv"), whose middle
+            // part isn't a bare 5-digit number.
+            if (mid.length() == 5 && isAllDigits(mid)) {
+                uint32_t id = (uint32_t)mid.toInt();
+                if (id > maxId) maxId = id;
+            }
         }
         f = root.openNextFile();
     }

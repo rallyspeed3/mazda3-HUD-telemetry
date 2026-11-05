@@ -155,6 +155,20 @@ async function deleteLog(name) {
   refreshLogs();
 }
 
+// The ESP32 has no RTC/internet -- hand it our clock once on load so new
+// log files get real dated names instead of "log_00007.csv". Harmless if
+// someone else's browser already set it this boot; the board ignores it.
+async function syncClock() {
+  const now = new Date();
+  const body = new URLSearchParams({
+    y: now.getFullYear(), mo: now.getMonth() + 1, d: now.getDate(),
+    h: now.getHours(), mi: now.getMinutes(), s: now.getSeconds(),
+  });
+  try { await fetch('/api/set_time', { method: 'POST', body: body }); }
+  catch (e) { /* harmless if this one attempt fails -- next page load retries */ }
+}
+
+syncClock();
 setInterval(pollLive, 250);
 pollLive();
 refreshLogs();

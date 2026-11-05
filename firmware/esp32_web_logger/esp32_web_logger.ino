@@ -116,6 +116,23 @@ void handleRecordStop() {
     server.send(200, "application/json", "{\"ok\":true}");
 }
 
+// Called by the web page on load, with the browser's own clock. First
+// caller for this boot wins -- see CANTask_SetWallClock()'s comment in
+// can_task.h. After this succeeds, new logs get real dated filenames
+// instead of "log_00007.csv".
+void handleSetTime() {
+    if (!server.hasArg("y") || !server.hasArg("mo") || !server.hasArg("d") ||
+        !server.hasArg("h") || !server.hasArg("mi") || !server.hasArg("s")) {
+        sendJsonError("missing time fields");
+        return;
+    }
+    bool applied = CANTask_SetWallClock(
+        server.arg("y").toInt(), server.arg("mo").toInt(), server.arg("d").toInt(),
+        server.arg("h").toInt(), server.arg("mi").toInt(), server.arg("s").toInt());
+    server.send(200, "application/json",
+                String("{\"ok\":true,\"applied\":") + (applied ? "true" : "false") + "}");
+}
+
 void handleLogsRename() {
     if (!server.hasArg("name") || !server.hasArg("new")) {
         sendJsonError("missing name or new");
@@ -199,7 +216,10 @@ void setup() {
     CANTask_Init();
 
     WiFi.mode(WIFI_AP);
-    WiFi.softAP(AP_SSID, AP_PASS);
+    if (!WiFi.softAP(AP_SSID, AP_PASS)) {
+        Serial.println("ERROR: WiFi.softAP() failed -- the AP won't be visible. "
+                        "Try a power cycle (not just the reset button).");
+    }
     Serial.print("AP started. Connect to WiFi \"");
     Serial.print(AP_SSID);
     Serial.print("\", then open http://");
@@ -210,6 +230,7 @@ void setup() {
     server.on("/api/logs", handleLogsList);
     server.on("/api/record/start", HTTP_POST, handleRecordStart);
     server.on("/api/record/stop", HTTP_POST, handleRecordStop);
+    server.on("/api/set_time", HTTP_POST, handleSetTime);
     server.on("/api/logs/rename", HTTP_POST, handleLogsRename);
     server.on("/api/logs/delete", HTTP_POST, handleLogsDelete);
     server.on("/api/logs/download", HTTP_GET, handleLogsDownload);

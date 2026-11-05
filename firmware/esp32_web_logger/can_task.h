@@ -34,3 +34,14 @@ void CANTask_StopRecording();
 bool CANTask_IsRecording();
 String CANTask_CurrentLogName();   // "" when not recording
 uint32_t CANTask_CurrentLogRows();
+
+// The ESP32 has no RTC/internet, so it boots not knowing the real date or
+// time. The web page sends its browser's clock here on load; whichever
+// client's request arrives first wins for this boot -- later callers are
+// silently ignored, so log filenames stay consistent even if several
+// phones/laptops load the page over the course of a session. Once set,
+// log filenames switch from "log_00007.csv" to "log_2026-11-05_14-32-07.csv".
+// Returns true if this call was the one that set it, false if it was
+// ignored (already set, or the values looked bogus).
+bool CANTask_SetWallClock(int year, int month, int day, int hour, int minute, int second);
+bool CANTask_HasWallClock();
