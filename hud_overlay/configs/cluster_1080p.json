@@ -1,0 +1,135 @@
+{
+  "throttle": {
+    "col": "throttle",
+    "min": 0,
+    "max": 80
+  },
+  "brake": {
+    "col": "brake",
+    "min": 0,
+    "max": 10000
+  },
+  "steering": {
+    "col": "steering_deg",
+    "invert": false,
+    "max_display_deg": 540
+  },
+  "speed": {
+    "col": "speed",
+    "unit": "MPH",
+    "scale": 1.0
+  },
+  "rpm": {
+    "col": "rpm",
+    "max": 7000,
+    "limiter": 6500
+  },
+  "gear": {
+    "col": "gear",
+    "max": 6
+  },
+  "font": "/System/Library/Fonts/Supplemental/Arial Rounded Bold.ttf",
+  "layout": {
+    "style": "cluster",
+    "center_at": [
+      0.5,
+      0.82
+    ],
+    "scale": 1.0,
+    "panel_opacity": 0.88
+  },
+  "cluster": {
+    "limiter_color": [
+      90,
+      230,
+      255
+    ],
+    "abs_color": [
+      255,
+      165,
+      20
+    ],
+    "pedal_segments": 30,
+    "show_steering_angle": true,
+    "rpm_gradient": [
+      [
+        0.0,
+        [
+          70,
+          225,
+          80
+        ]
+      ],
+      [
+        0.3,
+        [
+          150,
+          232,
+          90
+        ]
+      ],
+      [
+        0.55,
+        [
+          235,
+          228,
+          120
+        ]
+      ],
+      [
+        0.8,
+        [
+          245,
+          165,
+          80
+        ]
+      ],
+      [
+        0.93,
+        [
+          245,
+          95,
+          50
+        ]
+      ],
+      [
+        1.0,
+        [
+          240,
+          40,
+          40
+        ]
+      ]
+    ],
+    "ghost_alpha": 24,
+    "gear_anim": 0.18
+  },
+  "colors": {
+    "throttle": [
+      125,
+      240,
+      135
+    ],
+    "brake": [
+      245,
+      70,
+      65
+    ]
+  },
+  "abs": {
+    "cols": [
+      "wheel_fl",
+      "wheel_fr",
+      "wheel_rl",
+      "wheel_rr"
+    ],
+    "lock_cols": [
+      "wheel_fl",
+      "wheel_fr"
+    ],
+    "slip": 0.25,
+    "min_speed": 10,
+    "max_throttle": 15,
+    "hold": 0.3
+  }
+}

@@ -12,6 +12,9 @@ HUD elements:
   - gear indicator, speed readout
   - RPM bar with shift lights (flashes at the shift point)
 
+Layout styles: "panel", "strip", and "cluster" (digital game-style cluster with
+a gradient RPM line that blinks at the rev limiter).
+
 Requires: Python 3.9+, Pillow, numpy, ffmpeg on PATH.
 
 Examples:
@@ -31,7 +34,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
 # ---------------------------------------------------------------- defaults
 
@@ -42,9 +45,15 @@ DEFAULT_CONFIG = {
     "steering": {"col": "steering_deg", "invert": False, "max_display_deg": 540},
     "speed": {"col": "speed", "unit": "MPH", "scale": 1.0},
     "rpm": {"col": "rpm", "max": 7000, "shift": 6200, "segments": 20},
-    "gear": {"col": "gear"},
+    "gear": {"col": "gear", "max": 6},            # cluster gear tape runs R, N, 1..max
+    # ABS lamp: lit when a front wheel is much slower than the fastest wheel (a lockup)
+    # while off the throttle, held on briefly so it doesn't flicker between samples.
+    # "cols" set the reference speed; only "lock_cols" can light the lamp, so a
+    # handbrake locking the rears doesn't count.
+    "abs": {"cols": ["wheel_fl", "wheel_fr", "wheel_rl", "wheel_rr"], "lock_cols": ["wheel_fl", "wheel_fr"],
+            "slip": 0.25, "min_speed": 10, "max_throttle": 15, "hold": 0.3},
     "layout": {
-        "style": "panel",              # "panel" (box with big wheel) or "strip" (thin full-width bar)
+        "style": "panel",              # "panel" (box with big wheel), "strip" (thin full-width bar) or "cluster"
         "anchor": "bottom-left",       # bottom-left | bottom-right | bottom-center | top-left | top-right
         "margin": 48,                  # px at 1080p, scales with output height
         "scale": 1.0,                  # overall HUD size multiplier
@@ -145,6 +154,57 @@ class Log:
                     vals.append(np.nan)     # e.g. 'N' for neutral in a gear column
             arr = np.array(vals, dtype=float)
             self.channels[key] = arr
+
+        # wheel lockup -> ABS lamp. Reference speed is the fastest of all wheels (and the
+        # car's speed), but only the lock_cols wheels (fronts) can light it, so handbrake
+        # turns don't. Off-throttle only, so one front spinning doesn't make the other
+        # look locked.
+        self.lock_t = np.array([])
+        self.locked = np.zeros(len(rows), dtype=bool)
+        ac = cfg.get("abs", {})
+        wcols = ac.get("cols", [])
+        if wcols and all(c_ in rows[0] for c_ in wcols):
+            def num(r, c_):
+                try:
+                    return float(r[c_])
+                except ValueError:
+                    return np.nan
+            wheels = np.array([[num(r, c_) for c_ in wcols] for r in rows], dtype=float)
+            ref = np.nanmax(np.column_stack([wheels, self.channels.get("speed", np.full(len(rows), np.nan))]), axis=1)
+            lcols = [c_ for c_ in ac.get("lock_cols", wcols) if c_ in wcols] or wcols
+            slowest = np.nanmin(wheels[:, [wcols.index(c_) for c_ in lcols]], axis=1)
+            thr = self.channels.get("throttle", np.zeros(len(rows)))
+            locked = ((ref >= float(ac.get("min_speed", 10)))
+                      & (slowest <= ref * (1 - float(ac.get("slip", 0.25))))
+                      & ~(thr > float(ac.get("max_throttle", 15))))
+            self.locked = locked
+            self.lock_t = self.t[locked]
+        elif wcols:
+            print("note: no wheel-speed columns in CSV; the ABS lamp will stay off", file=sys.stderr)
+        self.abs_hold = float(ac.get("hold", 0.3))
+
+        # gear shifts (sample indices where the gear changes), for the cluster's tape animation
+        g = self.channels.get("gear")
+        self.gear_steps = np.nan_to_num(g, nan=0.0) if g is not None else None
+        self.shift_idx = (np.flatnonzero(np.diff(self.gear_steps)) + 1) if g is not None else np.array([], int)
+
+    def abs_on(self, t):
+        cur = np.searchsorted(self.t, t, side="right") - 1      # sample at/before t
+        if 0 <= cur < len(self.locked) and self.locked[cur]:
+            return True
+        i = np.searchsorted(self.lock_t, t, side="right") - 1   # recent lockup: hold the lamp on
+        return bool(i >= 0 and t - self.lock_t[i] <= self.abs_hold)
+
+    def last_shift(self, t):
+        """(gear before the most recent shift at/before t, seconds since that shift)."""
+        if self.gear_steps is None:
+            return None, math.inf
+        i = np.searchsorted(self.t, t, side="right") - 1
+        j = np.searchsorted(self.shift_idx, i, side="right") - 1
+        if i < 0 or j < 0:
+            return None, math.inf
+        k = self.shift_idx[j]
+        return float(self.gear_steps[k - 1]), t - self.t[k]
 
     def value(self, key, t, step=False):
         arr = self.channels.get(key)
@@ -417,6 +477,291 @@ class StripHUD:
         return base
 
 
+class ClusterHUD:
+    """Game-style digital cluster. A navy body holds: a gradient RPM line that rises
+    into a plateau over the speed box (blinks at the rev limiter), a long row box with
+    an ABS lamp + steering wheel on the left and the gear (neighbouring gears ghosted) on
+    the right, a glossy speed box on top of the row, and a curved band of thin brake
+    (red, grows left) / throttle (green, grows right) segments that sweeps up at the ends."""
+
+    def __init__(self, cfg, short_side, font_path=None):
+        self.cfg = cfg
+        L = cfg["layout"]
+        self.k = short_side / 1080.0 * float(L.get("scale", 1.0))
+        self.f = 0.8 * self.k                  # layout is drawn in reference-image units, scaled by f
+        self.W, self.H = int(self.X(1150)), int(self.Y(445))
+        f = self.f
+        self.font_speed = load_font(font_path, int(136 * f))
+        self.font_unit = load_font(font_path, int(24 * f))
+        self.font_small = load_font(font_path, int(22 * f))
+        self.font_icon = load_font(font_path, int(16 * f))
+        self.wheel_d = int(84 * f)
+        self.wheel = make_wheel(self.wheel_d, cfg.get("wheel_image"))
+        self._font_path, self._gear_fonts = font_path, {}
+        self.col = cfg["colors"]
+        cc = cfg.get("cluster", {})
+        self.outline = tuple(cc.get("outline", [190, 200, 218]))
+        self.plate_top = tuple(cc.get("plate_top", [36, 41, 66]))
+        self.plate_bottom = tuple(cc.get("plate_bottom", [44, 52, 84]))
+        self.limiter_color = tuple(cc.get("limiter_color", [90, 230, 255]))
+        self.abs_color = tuple(cc.get("abs_color", [255, 165, 20]))
+        self.n_seg = int(cc.get("pedal_segments", 30))
+        self.show_angle = bool(cc.get("show_steering_angle", True))
+
+        # RPM line: low on the left, rises into a plateau over the speed box, dips back
+        # down and runs out to the right end (mirror image of the left side)
+        xs = np.linspace(140, 1032, 900)
+        up = np.clip((xs - 300) / 105, 0, 1)
+        down = np.clip((xs - 767) / 105, 0, 1)
+        ss = lambda u: u * u * (3 - 2 * u)
+        ys = 71 - 18 * (ss(up) - ss(down))
+        self.rpm_pts = [(self.X(x), self.Y(y)) for x, y in zip(xs, ys)]
+        seg_len = np.hypot(np.diff(xs), np.diff(ys))
+        self.rpm_s = np.concatenate([[0], np.cumsum(seg_len)]) / seg_len.sum()   # 0..1 along the path
+        stops = cc.get("rpm_gradient", [[0.0, [70, 225, 80]], [0.3, [150, 232, 90]], [0.55, [235, 228, 120]],
+                                        [0.8, [245, 165, 80]], [0.93, [245, 95, 50]], [1.0, [240, 40, 40]]])
+        self.rpm_cols = [tuple(int(np.interp(p, [s[0] for s in stops], [s[1][ch] for s in stops]))
+                               for ch in range(3)) for p in self.rpm_s]
+
+        # pedal segments: flat near the middle, curving up (and shortening) toward each end
+        self.segs = {}
+        for side in (-1, 1):
+            boxes = []
+            for i in range(self.n_seg):
+                x = 597 + i * 14.3
+                t = max(0.0, (x - 870) / 155)
+                cy = 348 - 46 * t ** 1.6
+                h = 86 - 34 * t ** 1.4
+                xa = 586 + side * (x - 586)
+                boxes.append([self.X(min(xa, xa + side * 9.5)), self.Y(cy - h / 2),
+                              self.X(max(xa, xa + side * 9.5)), self.Y(cy + h / 2)])
+            self.segs[side] = boxes
+        self.plate_img = self._plate()
+
+    def X(self, x):
+        return (x - 40) * self.f
+
+    def Y(self, y):
+        return (y - 20) * self.f
+
+    def R(self, x0, y0, x1, y1):
+        return [self.X(x0), self.Y(y0), self.X(x1), self.Y(y1)]
+
+    def _abs_icon(self, dr, color, width):
+        """Circle with a bracket arc either side and 'ABS' inside (the dash ABS lamp)."""
+        f = self.f
+        cx, cy, r = self.X(177), self.Y(170), 25 * f
+        dr.ellipse([cx - r, cy - r, cx + r, cy + r], outline=color, width=width)
+        R_ = r + 10 * f
+        box = [cx - R_, cy - R_, cx + R_, cy + R_]
+        dr.arc(box, 135, 225, fill=color, width=width)
+        dr.arc(box, -45, 45, fill=color, width=width)
+        self._centered(dr, cx, cy, "ABS", self.font_icon, color)
+
+    def _plate(self):
+        f, W, H = self.f, self.W, self.H
+        op = float(self.cfg["layout"].get("panel_opacity", 0))
+        base = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+
+        # body: tall rounded tub, tighter corners on top than on the bottom
+        top = Image.new("L", (W, H), 0)
+        ImageDraw.Draw(top).rounded_rectangle(self.R(70, 38, 1110, 428), radius=int(70 * f), fill=255)
+        bot = Image.new("L", (W, H), 0)
+        ImageDraw.Draw(bot).rounded_rectangle(self.R(70, 38, 1110, 428), radius=int(140 * f), fill=255)
+        mid = int(self.Y(230))
+        mask = Image.new("L", (W, H), 0)
+        mask.paste(top.crop((0, 0, W, mid)), (0, 0))
+        mask.paste(bot.crop((0, mid, W, H)), (0, mid))
+        grad = np.linspace(0, 1, H)[:, None, None]
+        rgb = (np.array(self.plate_top) * (1 - grad) + np.array(self.plate_bottom) * grad)
+        body = Image.fromarray(np.repeat(rgb, W, axis=1).astype(np.uint8), "RGB").convert("RGBA")
+        body.putalpha(mask.point(lambda a: int(a * op)))
+        base.alpha_composite(body)
+        edge = ImageChops.subtract(mask, mask.filter(ImageFilter.MinFilter(3)))
+        line = Image.new("RGBA", (W, H), rgba(self.outline))
+        line.putalpha(edge.point(lambda a: int(a * 0.12)))
+        base.alpha_composite(line)
+
+        dr = ImageDraw.Draw(base)
+        lw = max(1, int(2.4 * f))
+        # pedal band background: a soft lighter swoosh behind the segments
+        env = []
+        for side in (1, -1):
+            pts = [((b[0] + b[2]) / 2, b[1] - 9 * f) for b in self.segs[side]]
+            env += pts if side == 1 else pts[::-1]
+        ends = []
+        for side in (1, -1):
+            pts = [((b[0] + b[2]) / 2, b[3] + 9 * f) for b in self.segs[side]]
+            ends += pts[::-1] if side == 1 else pts
+        band = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        bd = ImageDraw.Draw(band)
+        bd.polygon(env[len(env) // 2:] + env[:len(env) // 2] + ends, fill=rgba(self.outline, 26))
+        bd.line(env[len(env) // 2:] + env[:len(env) // 2], fill=rgba(self.outline, 34), width=lw)
+        base.alpha_composite(band.filter(ImageFilter.GaussianBlur(2.5 * f)))
+
+        # long row box (left: ABS + wheel, right: gear); the speed box sits on top of it
+        dr.rounded_rectangle(self.R(108, 92, 1062, 246), radius=int(24 * f), fill=(0, 0, 0, 30),
+                             outline=rgba(self.outline, 165), width=lw)
+        # ABS tile
+        dr.rounded_rectangle(self.R(131, 112, 225, 230), radius=int(12 * f), fill=(71, 82, 107, 235),
+                             outline=(120, 130, 152, 110), width=max(1, int(1.5 * f)))
+        self._abs_icon(dr, (100, 110, 136, 255), max(1, int(3 * f)))
+
+        # speed box: bright outer bezel, dark band, inner panel
+        cb = self.R(382, 76, 790, 266)
+        dr.rounded_rectangle(cb, radius=int(28 * f), fill=(82, 88, 112, 255),
+                             outline=rgba(self.outline, 235), width=max(2, int(3.5 * f)))
+        ib = self.R(392, 86, 780, 256)
+        inner = Image.new("RGBA", (int(ib[2] - ib[0]), int(ib[3] - ib[1])), (0, 0, 0, 0))
+        g = np.linspace(0, 1, inner.height)[:, None, None]
+        rgb = np.array([44, 50, 76]) * (1 - g) + np.array([30, 35, 56]) * g
+        fill = Image.fromarray(np.repeat(rgb, inner.width, axis=1).astype(np.uint8), "RGB").convert("RGBA")
+        m = Image.new("L", inner.size, 0)
+        ImageDraw.Draw(m).rounded_rectangle([0, 0, inner.width - 1, inner.height - 1], radius=int(22 * f), fill=255)
+        inner.paste(fill, (0, 0), m)
+        ImageDraw.Draw(inner).rounded_rectangle([0, 0, inner.width - 1, inner.height - 1], radius=int(22 * f),
+                                                outline=rgba(self.outline, 60), width=max(1, int(1.5 * f)))
+        base.alpha_composite(inner, (int(ib[0]), int(ib[1])))
+
+        # unit label notched into the bottom of the speed box
+        unit = self.cfg["speed"].get("unit", "MPH")
+        uw = dr.textlength(unit, font=self.font_unit) + 26 * f
+        cx = self.X(586)
+        dr.rectangle([cx - uw / 2, self.Y(258), cx + uw / 2, self.Y(276)], fill=rgba(self.plate_top, int(255 * op)))
+        self._centered(dr, cx, self.Y(265), unit, self.font_unit, (235, 238, 245, 255))
+
+        # dash before the gear tape
+        dr.line([self.X(800), self.Y(170), self.X(834), self.Y(170)], fill=rgba(self.outline, 70),
+                width=max(1, int(3 * f)))
+        return base
+
+    def _centered(self, dr, cx, cy, txt, font, fill):
+        b = dr.textbbox((0, 0), txt, font=font)
+        dr.text((cx - (b[0] + b[2]) / 2, cy - (b[1] + b[3]) / 2), txt, font=font, fill=fill)
+
+    def draw(self, v, flash_on):
+        f, c, W = self.f, self.cfg, self.W
+        base = self.plate_img.copy()
+        img = Image.new("RGBA", (W, self.H), (0, 0, 0, 0))
+        glow = Image.new("RGBA", (W, self.H), (0, 0, 0, 0))   # lit elements, blurred under the sharp copy
+        dr, gd = ImageDraw.Draw(img), ImageDraw.Draw(glow)
+        txt = rgba(self.col["text"])
+        lw = max(2, int(7 * f))
+
+        def norm(key, val):
+            if val is None:
+                return 0.0
+            lo, hi = float(c[key]["min"]), float(c[key]["max"])
+            return max(0.0, min(1.0, (val - lo) / (hi - lo))) if hi != lo else 0.0
+
+        # --- RPM line (gradient along the path; whole line blinks at the rev limiter)
+        rc = c["rpm"]
+        rpm = v["rpm"]
+        rmax = float(rc["max"])
+        limiter = float(rc.get("limiter", rc.get("shift", rmax)))
+        pts = self.rpm_pts
+        dr.line(pts, fill=rgba(self.outline, 34), width=lw, joint="curve")
+        for (ex, ey) in (pts[0], pts[-1]):     # rounded caps on the track
+            dr.ellipse([ex - lw / 2, ey - lw / 2, ex + lw / 2, ey + lw / 2], fill=rgba(self.outline, 34))
+        if rpm is not None and rpm >= limiter:
+            if flash_on:
+                w2 = lw + int(2 * f)
+                for layer in (dr, gd):
+                    layer.line(pts, fill=rgba(self.limiter_color), width=w2, joint="curve")
+                    for (ex, ey) in (pts[0], pts[-1]):
+                        layer.ellipse([ex - w2 / 2, ey - w2 / 2, ex + w2 / 2, ey + w2 / 2],
+                                      fill=rgba(self.limiter_color))
+        elif rpm is not None:
+            n = int(np.searchsorted(self.rpm_s, max(0.0, min(1.0, rpm / rmax))))
+            for i in range(1, n):
+                for layer in (dr, gd):
+                    layer.line([pts[i - 1], pts[i]], fill=rgba(self.rpm_cols[i]), width=lw)
+            if n > 1:   # rounded caps on both ends of the lit part
+                for j in (0, n - 1):
+                    (ex, ey), r = pts[j], lw / 2
+                    for layer in (dr, gd):
+                        layer.ellipse([ex - r, ey - r, ex + r, ey + r], fill=rgba(self.rpm_cols[j]))
+
+        # --- ABS lamp (lit on wheel lockup)
+        if v.get("abs"):
+            tile = self.R(131, 112, 225, 230)
+            dr.rounded_rectangle(tile, radius=int(12 * f), fill=(40, 30, 20, 255),
+                                 outline=rgba(self.abs_color, 120), width=max(1, int(1.5 * f)))
+            self._abs_icon(gd, rgba(self.abs_color, 150), max(2, int(5 * f)))
+            self._abs_icon(dr, rgba(self.abs_color), max(1, int(3.5 * f)))
+
+        # --- steering wheel next to the ABS lamp
+        st = v["steering"]
+        wheel = self.wheel
+        if st is not None:
+            ang = -st if c["steering"].get("invert") else st
+            ang = max(-c["steering"]["max_display_deg"], min(c["steering"]["max_display_deg"], ang))
+            wheel = self.wheel.rotate(-ang, resample=Image.BICUBIC)   # positive angle = clockwise (right)
+        wcx, wcy = self.X(300), self.Y(158 if self.show_angle else 170)
+        img.alpha_composite(wheel, (int(wcx - self.wheel_d / 2), int(wcy - self.wheel_d / 2)))
+        if self.show_angle:
+            self._centered(dr, wcx, self.Y(224), "--" if st is None else f"{st:+.0f}°", self.font_small,
+                           rgba(self.col["text"], 200))
+
+        # --- speed
+        spd = v["speed"]
+        stxt = "--" if spd is None else f"{spd * float(c['speed'].get('scale', 1.0)):.0f}"
+        self._centered(dr, self.X(586), self.Y(168), stxt, self.font_speed, txt)
+
+        # --- gear tape (R, N, 1..max): current gear big in the middle, neighbours ghosted.
+        # On a shift the tape slides to the new gear, which grows and brightens as it arrives.
+        tape = ["R", "N"] + [str(g) for g in range(1, int(c["gear"].get("max", 6)) + 1)]
+
+        def slot(g):
+            name = "N" if g is None or g == 0 else ("R" if g < 0 else str(int(g)))
+            return tape.index(name) if name in tape else None
+
+        gi = slot(v["gear"])
+        pos = gi
+        prev, since = v.get("shift", (None, math.inf))
+        pi = slot(prev)
+        dur = float(c.get("cluster", {}).get("gear_anim", 0.18))
+        if gi is not None and pi is not None and since < dur:
+            u = 1 - (1 - since / dur) ** 3                 # ease-out cubic
+            pos = pi + (gi - pi) * u
+        if pos is not None:
+            ghost_a = int(c.get("cluster", {}).get("ghost_alpha", 24))
+            layer = Image.new("RGBA", (W, self.H), (0, 0, 0, 0))
+            ld = ImageDraw.Draw(layer)
+            for idx in range(max(0, int(pos) - 2), min(len(tape), int(pos) + 3)):
+                d = abs(idx - pos)
+                if d >= 1.6:
+                    continue
+                near = max(0.0, 1 - d)                    # 1 = centered, 0 = ghost slot
+                size = int((70 + 28 * near) * f)
+                if size not in self._gear_fonts:
+                    self._gear_fonts[size] = load_font(self._font_path, size)
+                alpha = ghost_a + (255 - ghost_a) * near ** 2
+                if d > 1:
+                    alpha = ghost_a * max(0.0, (1.6 - d) / 0.6)
+                self._centered(ld, self.X(940 + (idx - pos) * 72), self.Y(172), tape[idx],
+                               self._gear_fonts[size], rgba(self.col["text"], int(alpha)))
+            clip = Image.new("L", (W, self.H), 0)
+            ImageDraw.Draw(clip).rectangle(self.R(842, 94, 1056, 244), fill=255)
+            layer.putalpha(ImageChops.multiply(layer.getchannel("A"), clip))
+            img.alpha_composite(layer)
+
+        # --- pedal segments: brake grows left from center, throttle grows right
+        for key, side, color in (("brake", -1, self.col["brake"]), ("throttle", 1, self.col["throttle"])):
+            lit = norm(key, v[key]) * self.n_seg
+            for i, box in enumerate(self.segs[side]):
+                amt = max(0.0, min(1.0, lit - i))    # partial brightness on the leading segment
+                if amt > 0:
+                    for layer in (dr, gd):
+                        layer.rectangle(box, fill=rgba(color, int(255 * amt)))
+
+        wide, tight = glow.filter(ImageFilter.GaussianBlur(14 * f)), glow.filter(ImageFilter.GaussianBlur(3 * f))
+        for layer in (wide, wide, tight, tight, tight):    # stacked for a strong neon bloom
+            base.alpha_composite(layer)
+        base.alpha_composite(img)
+        return base
+
+
 def place(anchor, frame_w, frame_h, hud_w, hud_h, margin):
     left, right = margin, frame_w - hud_w - margin
     top, bottom = margin, frame_h - hud_h - margin
@@ -499,7 +844,13 @@ def main():
 
     short = min(args.width, args.height)
     style = cfg["layout"].get("style", "panel")
-    hud = StripHUD(cfg, args.width, short, args.font) if style == "strip" else HUD(cfg, short, args.font)
+    font = args.font or cfg.get("font")
+    if style == "strip":
+        hud = StripHUD(cfg, args.width, short, font)
+    elif style == "cluster":
+        hud = ClusterHUD(cfg, short, font)
+    else:
+        hud = HUD(cfg, short, font)
     margin = int(cfg["layout"].get("margin", 48) * short / 1080)
     center_at = cfg["layout"].get("center_at")
     if center_at:   # [x_frac, y_frac] of the frame where the HUD's center goes
@@ -517,6 +868,8 @@ def main():
             "speed": log.value("speed", td),
             "rpm": log.value("rpm", td),
             "gear": log.value("gear", td, step=True),
+            "abs": log.abs_on(td),
+            "shift": log.last_shift(td),
         }
 
     def flash(i):
