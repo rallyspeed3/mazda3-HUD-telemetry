@@ -27,10 +27,12 @@ import argparse
 import csv
 import json
 import math
+import multiprocessing as mp
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -45,7 +47,9 @@ DEFAULT_CONFIG = {
     "steering": {"col": "steering_deg", "invert": False, "max_display_deg": 540},
     "speed": {"col": "speed", "unit": "MPH", "scale": 1.0},
     "rpm": {"col": "rpm", "max": 7000, "shift": 6200, "segments": 20},
-    "gear": {"col": "gear", "max": 6},            # cluster gear tape runs R, N, 1..max
+    "gear": {"col": "gear", "max": 6,              # cluster gear tape runs R, N, 1..max
+             "neutral_debounce": 1.0},             # ignore a reading of N shorter than this (clutch-in
+                                                    # during a normal shift) instead of animating through it
     # ABS lamp: lit when a front wheel is much slower than the fastest wheel (a lockup)
     # while off the throttle, held on briefly so it doesn't flicker between samples.
     # "cols" set the reference speed; only "lock_cols" can light the lamp, so a
@@ -117,6 +121,36 @@ def parse_time_value(s):
     return dt.timestamp(), True
 
 
+def debounce_gear(t, gear, hold):
+    """A manual transmission reads N for a few hundred ms every time the clutch goes in
+    for a shift -- real on the bus, but it makes the cluster's gear tape slide back to N
+    and out again on every single shift instead of sliding straight to the new gear.
+    Any 0 (neutral) run shorter than `hold` seconds, bracketed by nonzero gears on both
+    sides, is filled with the gear before it (so the display holds the old gear through
+    the dip and only animates once the new gear actually shows up). A real stop in
+    neutral lasts much longer than a clutch dip, so it's left alone."""
+    if hold <= 0:
+        return gear
+    out = gear.copy()
+    n = len(gear)
+    i = 0
+    while i < n:
+        if gear[i] == 0:
+            j = i
+            while j < n and gear[j] == 0:
+                j += 1
+            prev_val = out[i - 1] if i > 0 else None
+            next_val = gear[j] if j < n else None
+            blip_end = t[j] if j < n else t[-1]
+            if (prev_val is not None and prev_val != 0 and next_val is not None and next_val != 0
+                    and (blip_end - t[i]) < hold):
+                out[i:j] = prev_val
+            i = j
+        else:
+            i += 1
+    return out
+
+
 class Log:
     def __init__(self, path, cfg):
         with open(path, newline="") as f:
@@ -185,7 +219,11 @@ class Log:
 
         # gear shifts (sample indices where the gear changes), for the cluster's tape animation
         g = self.channels.get("gear")
-        self.gear_steps = np.nan_to_num(g, nan=0.0) if g is not None else None
+        if g is not None:
+            hold = float(cfg["gear"].get("neutral_debounce", 1.0))
+            g = debounce_gear(self.t, np.nan_to_num(g, nan=0.0), hold)
+            self.channels["gear"] = g      # also smooths the plain gear readout (panel/strip styles)
+        self.gear_steps = g
         self.shift_idx = (np.flatnonzero(np.diff(self.gear_steps)) + 1) if g is not None else np.array([], int)
 
     def abs_on(self, t):
@@ -772,6 +810,91 @@ def place(anchor, frame_w, frame_h, hud_w, hud_h, margin):
     }.get(anchor, (left, bottom))
 
 
+def build_hud(cfg, width, height, font):
+    """(hud, px, py): the HUD renderer for this config plus where its panel's
+    top-left corner lands in the full frame (used only by --full-frame)."""
+    short = min(width, height)
+    style = cfg["layout"].get("style", "panel")
+    if style == "strip":
+        hud = StripHUD(cfg, width, short, font)
+    elif style == "cluster":
+        hud = ClusterHUD(cfg, short, font)
+    else:
+        hud = HUD(cfg, short, font)
+    margin = int(cfg["layout"].get("margin", 48) * short / 1080)
+    center_at = cfg["layout"].get("center_at")
+    if center_at:
+        px = int(width * center_at[0] - hud.W / 2)
+        py = int(height * center_at[1] - hud.H / 2)
+    else:
+        px, py = place(cfg["layout"].get("anchor", "bottom-left"), width, height, hud.W, hud.H, margin)
+    return hud, px, py
+
+
+def ffmpeg_encode_cmd(width, height, hud_w, hud_h, fps_ff, full_frame, px, py, out_path):
+    cmd = ["ffmpeg", "-y", "-loglevel", "error",
+           "-f", "rawvideo", "-pix_fmt", "rgba", "-s", f"{hud_w}x{hud_h}", "-r", fps_ff, "-i", "-"]
+    if not full_frame:
+        cmd += ["-vf", "format=yuva444p10le"]
+    else:
+        cmd += ["-vf", f"pad={width}:{height}:{px}:{py}:color=black@0,format=yuva444p10le"]
+    cmd += ["-c:v", "prores_ks", "-profile:v", "4444", "-pix_fmt", "yuva444p10le",
+            "-alpha_bits", "16", "-vendor", "apl0", out_path]
+    return cmd
+
+
+def chunk_bounds(n_frames, workers):
+    """List of (frame_start, frame_count) splitting n_frames into <= workers contiguous chunks."""
+    workers = max(1, min(workers, n_frames))
+    base, rem = divmod(n_frames, workers)
+    bounds, s = [], 0
+    for w in range(workers):
+        cnt = base + (1 if w < rem else 0)
+        if cnt:
+            bounds.append((s, cnt))
+            s += cnt
+    return bounds
+
+
+def render_chunk_worker(worker_id, csv_path, cfg, width, height, fps, fps_ff,
+                         start, offset, full_frame, font, frame_start, frame_count, out_path, step):
+    """Runs in its own process: renders frames [frame_start, frame_start+frame_count) of the
+    overall timeline to its own ProRes file, which the parent concatenates afterward."""
+    log = Log(csv_path, cfg)
+    hud, px, py = build_hud(cfg, width, height, font)
+
+    def values_at(t):
+        td = t - offset
+        return {
+            "throttle": log.value("throttle", td),
+            "brake": log.value("brake", td),
+            "steering": log.value("steering", td),
+            "speed": log.value("speed", td),
+            "rpm": log.value("rpm", td),
+            "gear": log.value("gear", td, step=True),
+            "abs": log.abs_on(td),
+            "shift": log.last_shift(td),
+        }
+
+    def flash(i):
+        return (i // max(1, int(fps / 8))) % 2 == 0     # global frame index keeps the flash phase
+
+    cmd = ffmpeg_encode_cmd(width, height, hud.W, hud.H, fps_ff, full_frame, px, py, out_path)
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    try:
+        for local_i in range(frame_count):
+            i = frame_start + local_i
+            t = start + i / fps
+            proc.stdin.write(hud.draw(values_at(t), flash(i)).tobytes())
+            if local_i % step == 0:
+                print(f"  [w{worker_id}] {local_i / fps:6.1f} s / {frame_count / fps:.1f} s", flush=True)
+    finally:
+        proc.stdin.close()
+        rc = proc.wait()
+    if rc != 0:
+        raise RuntimeError(f"worker {worker_id} ffmpeg failed ({rc})")
+
+
 # ---------------------------------------------------------------- timecode
 
 def fps_parts(fps_str):
@@ -829,6 +952,9 @@ def main():
     ap.add_argument("--preview", type=float, help="render one frame at this many seconds after --start")
     ap.add_argument("--preview-out", default="hud_preview.png")
     ap.add_argument("--preview-bg", help="image to preview the HUD over (e.g. a screenshot of your edit)")
+    ap.add_argument("--workers", type=int, default=1,
+                    help="render N chunks of the timeline in parallel processes, then concat "
+                         "(ignored for --preview; try your CPU core count)")
     args = ap.parse_args()
 
     cfg = DEFAULT_CONFIG
@@ -842,22 +968,8 @@ def main():
     end = log.t[-1] if args.duration is None else start + args.duration
     n_frames = max(1, int(math.floor((end - start) * fps)) + 1)
 
-    short = min(args.width, args.height)
-    style = cfg["layout"].get("style", "panel")
     font = args.font or cfg.get("font")
-    if style == "strip":
-        hud = StripHUD(cfg, args.width, short, font)
-    elif style == "cluster":
-        hud = ClusterHUD(cfg, short, font)
-    else:
-        hud = HUD(cfg, short, font)
-    margin = int(cfg["layout"].get("margin", 48) * short / 1080)
-    center_at = cfg["layout"].get("center_at")
-    if center_at:   # [x_frac, y_frac] of the frame where the HUD's center goes
-        px = int(args.width * center_at[0] - hud.W / 2)
-        py = int(args.height * center_at[1] - hud.H / 2)
-    else:
-        px, py = place(cfg["layout"].get("anchor", "bottom-left"), args.width, args.height, hud.W, hud.H, margin)
+    hud, px, py = build_hud(cfg, args.width, args.height, font)
 
     def values_at(t):
         td = t - args.offset
@@ -896,19 +1008,13 @@ def main():
     elif args.timecode not in ("auto", "none"):
         tc = args.timecode
 
-    cmd = [
-        "ffmpeg", "-y", "-loglevel", "error",
-        "-f", "rawvideo", "-pix_fmt", "rgba", "-s", f"{hud.W}x{hud.H}", "-r", fps_ff, "-i", "-",
-    ]
-    if not args.full_frame:
-        cmd += ["-vf", "format=yuva444p10le"]          # small clip; position it in Premiere
-    else:
-        cmd += ["-vf", f"pad={args.width}:{args.height}:{px}:{py}:color=black@0,format=yuva444p10le"]
-    cmd += ["-c:v", "prores_ks", "-profile:v", "4444", "-pix_fmt", "yuva444p10le",
-            "-alpha_bits", "16", "-vendor", "apl0"]
+    if args.workers > 1:
+        render_parallel(args, cfg, log, fps, fps_ff, start, n_frames, font, tc)
+        return
+
+    cmd = ffmpeg_encode_cmd(args.width, args.height, hud.W, hud.H, fps_ff, args.full_frame, px, py, args.out)
     if tc:
-        cmd += ["-timecode", tc]
-    cmd += [args.out]
+        cmd[-1:-1] = ["-timecode", tc]       # insert before the output path
 
     print(f"rendering {n_frames} frames @ {fps:.3f} fps ({n_frames / fps:.1f} s)"
           + (f", timecode {tc}" if tc else ""))
@@ -925,6 +1031,43 @@ def main():
         rc = proc.wait()
     if rc != 0:
         sys.exit(f"ffmpeg failed ({rc})")
+    print(f"done: {args.out}")
+
+
+def render_parallel(args, cfg, log, fps, fps_ff, start, n_frames, font, tc):
+    bounds = chunk_bounds(n_frames, args.workers)
+    step = max(1, int(round(fps)) * 5)
+    print(f"rendering {n_frames} frames @ {fps:.3f} fps ({n_frames / fps:.1f} s) "
+          f"across {len(bounds)} worker(s)" + (f", timecode {tc}" if tc else ""))
+
+    tmpdir = tempfile.mkdtemp(prefix="hud_render_")
+    try:
+        chunk_paths = [os.path.join(tmpdir, f"chunk_{wid:03d}.mov") for wid in range(len(bounds))]
+        procs = []
+        for wid, ((fstart, fcount), out_path) in enumerate(zip(bounds, chunk_paths)):
+            p = mp.Process(target=render_chunk_worker, args=(
+                wid, args.csv, cfg, args.width, args.height, fps, fps_ff,
+                start, args.offset, args.full_frame, font, fstart, fcount, out_path, step))
+            p.start()
+            procs.append(p)
+        for p in procs:
+            p.join()
+        if any(p.exitcode != 0 for p in procs):
+            sys.exit("one or more render workers failed")
+
+        list_path = os.path.join(tmpdir, "concat.txt")
+        with open(list_path, "w") as f:
+            for cp in chunk_paths:
+                f.write(f"file '{cp.replace(chr(92), '/')}'\n")
+        cmd = ["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy"]
+        if tc:
+            cmd += ["-timecode", tc]
+        cmd += [args.out]
+        rc = subprocess.run(cmd).returncode
+        if rc != 0:
+            sys.exit(f"ffmpeg concat failed ({rc})")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
     print(f"done: {args.out}")
 
 
