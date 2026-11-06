@@ -45,3 +45,11 @@ uint32_t CANTask_CurrentLogRows();
 // ignored (already set, or the values looked bogus).
 bool CANTask_SetWallClock(int year, int month, int day, int hour, int minute, int second);
 bool CANTask_HasWallClock();
+
+// Recording state lives only in RAM, so it would normally be lost if the
+// board ever resets while recording (brownout, a WiFi/AP hiccup, a panic --
+// anything other than someone pressing "Stop Recording"). CANTask_Init()
+// checks for a marker file left behind by CANTask_StartRecording() and, if
+// one is there, reopens that log in append mode and keeps writing to it
+// automatically -- no client needs to be connected for this to happen.
+// Recording is still stopped only by an explicit /api/record/stop call.

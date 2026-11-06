@@ -88,10 +88,10 @@ void handleLogsList() {
     File f = root.openNextFile();
     bool first = true;
     while (f) {
-        if (!f.isDirectory()) {
+        String name = f.name();
+        if (!f.isDirectory() && name.endsWith(".csv")) {
             if (!first) json += ",";
             first = false;
-            String name = f.name();
             json += "{\"name\":\"" + name + "\",\"size\":" + String(f.size()) + "}";
         }
         f = root.openNextFile();
@@ -216,6 +216,7 @@ void setup() {
     CANTask_Init();
 
     WiFi.mode(WIFI_AP);
+    WiFi.setSleep(false);   // modem sleep saves power but adds latency/drops that can look like a dead AP to clients
     if (!WiFi.softAP(AP_SSID, AP_PASS)) {
         Serial.println("ERROR: WiFi.softAP() failed -- the AP won't be visible. "
                         "Try a power cycle (not just the reset button).");

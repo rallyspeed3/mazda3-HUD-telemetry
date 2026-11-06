@@ -46,6 +46,12 @@ static volatile uint32_t g_logRows = 0;
 static uint32_t g_nextLogId = 1;
 static bool g_wallClockSet = false;
 
+// Written with the current log's name while recording, removed on an
+// explicit stop. Its presence at boot means the board reset mid-recording
+// (power blip, WiFi/AP hiccup, crash) rather than someone stopping it, so
+// CANTask_Init() uses it to resume logging to the same file.
+static const char* ACTIVE_MARKER_PATH = "/.active_log";
+
 // ---- wall clock (set once, by whichever browser loads the page first) ----
 bool CANTask_SetWallClock(int year, int month, int day, int hour, int minute, int second) {
     if (g_wallClockSet) return false;   // first one wins for this boot
@@ -128,6 +134,12 @@ String CANTask_StartRecording() {
     f.print("time,throttle,brake,steering_deg,speed,rpm,gear,gear_raw,"
             "wheel_fl,wheel_fr,wheel_rl,wheel_rr\n");
 
+    File marker = FFat.open(ACTIVE_MARKER_PATH, FILE_WRITE);
+    if (marker) {
+        marker.print(name);
+        marker.close();
+    }
+
     g_logFile = f;
     g_logName = name;
     g_logRows = 0;
@@ -142,6 +154,39 @@ void CANTask_StopRecording() {
     g_logFile.flush();
     g_logFile.close();
     g_logName = "";
+    FFat.remove(ACTIVE_MARKER_PATH);
+}
+
+// Called once from CANTask_Init(), before the CAN task starts. If the
+// marker from an unfinished recording is still there, the board reset
+// mid-drive -- reopen that file in append mode and keep logging to it
+// rather than silently losing the rest of the drive.
+static void resumeRecordingIfAny() {
+    if (!FFat.exists(ACTIVE_MARKER_PATH)) return;
+
+    File marker = FFat.open(ACTIVE_MARKER_PATH, FILE_READ);
+    if (!marker) return;
+    String name = marker.readString();
+    marker.close();
+    name.trim();
+
+    if (name.length() == 0 || !FFat.exists(name)) {
+        FFat.remove(ACTIVE_MARKER_PATH);   // stale marker, nothing to resume
+        return;
+    }
+
+    File f = FFat.open(name, FILE_APPEND);
+    if (!f) {
+        FFat.remove(ACTIVE_MARKER_PATH);
+        return;
+    }
+
+    g_logFile = f;
+    g_logName = name;
+    g_logRows = 0;   // exact count unknown after resume -- only affects the once-a-second flush cadence and the UI's row counter
+    g_recording = true;
+    Serial.print("Resumed recording after reset: ");
+    Serial.println(name);
 }
 
 bool CANTask_IsRecording() { return g_recording; }
@@ -259,6 +304,7 @@ void CANTask_Init() {
         Serial.println("ERROR: FFat mount failed even after format attempt");
     }
     scanNextLogId();
+    resumeRecordingIfAny();
 
     twai_general_config_t g_config =
         TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_NORMAL);
