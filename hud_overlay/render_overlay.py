@@ -57,7 +57,9 @@ DEFAULT_CONFIG = {
     "steering": {"col": "steering_deg", "invert": False, "max_display_deg": 540},
     "speed": {"col": "speed", "unit": "MPH", "scale": 1.0},
     "rpm": {"col": "rpm", "max": 7000, "shift": 6200, "segments": 20},
-    "gear": {"col": "gear", "max": 6},            # cluster gear tape runs R, N, 1..max
+    "gear": {"col": "gear", "max": 6,              # cluster gear tape runs R, N, 1..max
+             "neutral_debounce": 1.0},             # ignore a reading of N shorter than this (clutch-in
+                                                    # during a normal shift) instead of animating through it
     # ABS lamp: lit when a front wheel is much slower than the fastest wheel (a lockup)
     # while off the throttle, held on briefly so it doesn't flicker between samples.
     # "cols" set the reference speed; only "lock_cols" can light the lamp, so a
@@ -145,6 +147,36 @@ def parse_time_value(s):
     return dt.timestamp(), True
 
 
+def debounce_gear(t, gear, hold):
+    """A manual transmission reads N for a few hundred ms every time the clutch goes in
+    for a shift -- real on the bus, but it makes the cluster's gear tape slide back to N
+    and out again on every single shift instead of sliding straight to the new gear.
+    Any 0 (neutral) run shorter than `hold` seconds, bracketed by nonzero gears on both
+    sides, is filled with the gear before it (so the display holds the old gear through
+    the dip and only animates once the new gear actually shows up). A real stop in
+    neutral lasts much longer than a clutch dip, so it's left alone."""
+    if hold <= 0:
+        return gear
+    out = gear.copy()
+    n = len(gear)
+    i = 0
+    while i < n:
+        if gear[i] == 0:
+            j = i
+            while j < n and gear[j] == 0:
+                j += 1
+            prev_val = out[i - 1] if i > 0 else None
+            next_val = gear[j] if j < n else None
+            blip_end = t[j] if j < n else t[-1]
+            if (prev_val is not None and prev_val != 0 and next_val is not None and next_val != 0
+                    and (blip_end - t[i]) < hold):
+                out[i:j] = prev_val
+            i = j
+        else:
+            i += 1
+    return out
+
+
 class Log:
     def __init__(self, path, cfg):
         with open(path, newline="") as f:
@@ -229,7 +261,11 @@ class Log:
 
         # gear shifts (sample indices where the gear changes), for the cluster's tape animation
         g = self.channels.get("gear")
-        self.gear_steps = np.nan_to_num(g, nan=0.0) if g is not None else None
+        if g is not None:
+            hold = float(cfg["gear"].get("neutral_debounce", 1.0))
+            g = debounce_gear(self.t, np.nan_to_num(g, nan=0.0), hold)
+            self.channels["gear"] = g      # also smooths the plain gear readout (panel/strip styles)
+        self.gear_steps = g
         self.shift_idx = (np.flatnonzero(np.diff(self.gear_steps)) + 1) if g is not None else np.array([], int)
 
     def abs_on(self, t):
@@ -908,6 +944,27 @@ def place(anchor, frame_w, frame_h, hud_w, hud_h, margin):
     }.get(anchor, (left, bottom))
 
 
+def build_hud(cfg, width, height, font):
+    """(hud, px, py): the HUD renderer for this config plus where its panel's
+    top-left corner lands in the full frame (used only by --full-frame)."""
+    short = min(width, height)
+    style = cfg["layout"].get("style", "panel")
+    if style == "strip":
+        hud = StripHUD(cfg, width, short, font)
+    elif style == "cluster":
+        hud = ClusterHUD(cfg, short, font)
+    else:
+        hud = HUD(cfg, short, font)
+    margin = int(cfg["layout"].get("margin", 48) * short / 1080)
+    center_at = cfg["layout"].get("center_at")
+    if center_at:
+        px = int(width * center_at[0] - hud.W / 2)
+        py = int(height * center_at[1] - hud.H / 2)
+    else:
+        px, py = place(cfg["layout"].get("anchor", "bottom-left"), width, height, hud.W, hud.H, margin)
+    return hud, px, py
+
+
 # ---------------------------------------------------------------- timecode
 
 def fps_parts(fps_str):
@@ -1107,21 +1164,8 @@ def main():
     n_frames = max(1, int(math.floor((end - start) * fps)) + 1)
 
     short = min(args.width, args.height)
-    style = cfg["layout"].get("style", "panel")
     font = args.font or cfg.get("font")
-    if style == "strip":
-        hud = StripHUD(cfg, args.width, short, font)
-    elif style == "cluster":
-        hud = ClusterHUD(cfg, short, font)
-    else:
-        hud = HUD(cfg, short, font)
-    margin = int(cfg["layout"].get("margin", 48) * short / 1080)
-    center_at = cfg["layout"].get("center_at")
-    if center_at:   # [x_frac, y_frac] of the frame where the HUD's center goes
-        px = int(args.width * center_at[0] - hud.W / 2)
-        py = int(args.height * center_at[1] - hud.H / 2)
-    else:
-        px, py = place(cfg["layout"].get("anchor", "bottom-left"), args.width, args.height, hud.W, hud.H, margin)
+    hud, px, py = build_hud(cfg, args.width, args.height, font)
 
     # The map is always its own separate clip (own file, own tight panel-sized
     # frame) rather than composited onto the gauge cluster's canvas -- so it
