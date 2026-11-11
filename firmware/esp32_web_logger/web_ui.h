@@ -61,6 +61,7 @@ const char INDEX_HTML[] PROGMEM = R"HTMLPAGE(
     <div class="stat"><div class="val" id="s_throttle">--</div><div class="label">Throttle %</div></div>
     <div class="stat"><div class="val" id="s_brake">--</div><div class="label">Brake</div></div>
     <div class="stat"><div class="val" id="s_steer">--</div><div class="label">Steering</div></div>
+    <div class="stat"><div class="val" id="s_gps">--</div><div class="label">GPS</div></div>
   </div>
 </div>
 
@@ -99,6 +100,9 @@ async function pollLive() {
     document.getElementById('s_throttle').textContent = j.throttle.toFixed(0);
     document.getElementById('s_brake').textContent = j.brake;
     document.getElementById('s_steer').textContent = j.steering.toFixed(0) + "°";
+    document.getElementById('s_gps').textContent = j.gps_valid
+      ? j.gps_lat.toFixed(4) + ", " + j.gps_lon.toFixed(4)
+      : "no fix";
 
     recording = j.recording;
     const btn = document.getElementById('recBtn');
@@ -158,12 +162,11 @@ async function deleteLog(name) {
 // The ESP32 has no RTC/internet -- hand it our clock once on load so new
 // log files get real dated names instead of "log_00007.csv". Harmless if
 // someone else's browser already set it this boot; the board ignores it.
+// Sends epoch milliseconds (always UTC, unambiguous) rather than local
+// Y/M/D/h/m/s fields -- the board applies its own timezone offset when it
+// names log files, so sending already-local fields here would double-shift.
 async function syncClock() {
-  const now = new Date();
-  const body = new URLSearchParams({
-    y: now.getFullYear(), mo: now.getMonth() + 1, d: now.getDate(),
-    h: now.getHours(), mi: now.getMinutes(), s: now.getSeconds(),
-  });
+  const body = new URLSearchParams({ epoch_ms: Date.now() });
   try { await fetch('/api/set_time', { method: 'POST', body: body }); }
   catch (e) { /* harmless if this one attempt fails -- next page load retries */ }
 }

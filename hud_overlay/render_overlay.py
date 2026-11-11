@@ -13,7 +13,17 @@ HUD elements:
   - RPM bar with shift lights (flashes at the shift point)
 
 Layout styles: "panel", "strip", and "cluster" (digital game-style cluster with
-a gradient RPM line that blinks at the rev limiter).
+a gradient RPM line that blinks at the rev limiter). Optionally also draws a
+small top-down GPS track map (set "map": {"enabled": true} in your config) if
+the CSV has gps_lat/gps_lon columns -- e.g. from esp32_web_logger's GPS
+integration.
+
+Two output modes:
+  --codec prores (default): ProRes 4444 with alpha, drop straight onto a
+    track in Premiere, no chroma key needed -- but huge files.
+  --codec h264: a small .mp4, composited onto a solid --bg-color instead of
+    staying transparent -- for a clip you just want to watch on a phone or
+    a TV, not drop onto other footage. Dramatically smaller files.
 
 Requires: Python 3.9+, Pillow, numpy, ffmpeg on PATH.
 
@@ -21,12 +31,14 @@ Examples:
   python render_overlay.py --csv run1.csv --config configs/horizontal_1080p.json --out run1_hud.mov
   python render_overlay.py --csv run1.csv --config configs/horizontal_1080p.json --preview 12.5 --preview-out frame.png
   python render_overlay.py --csv run1.csv --config configs/vertical_reels.json --width 1080 --height 1920 --out run1_hud_vertical.mov
+  python render_overlay.py --csv run1.csv --config configs/cluster_1080p.json --codec h264 --out run1_small.mp4
 """
 
 import argparse
 import csv
 import json
 import math
+import multiprocessing as mp
 import os
 import shutil
 import subprocess
@@ -69,6 +81,22 @@ DEFAULT_CONFIG = {
         "accent": [255, 196, 0],
     },
     "wheel_image": None,               # optional PNG of your own wheel (top of rim up, transparent background)
+    "gps_lat": {"col": "gps_lat"},
+    "gps_lon": {"col": "gps_lon"},
+    # Small top-down GPS track map, always rendered as its own separate clip
+    # (see --map-out) so it can be resized/repositioned independently of the
+    # gauge cluster in your editor. Off by default -- set "enabled": true in
+    # your config (needs gps_lat/gps_lon columns in the CSV, e.g. from
+    # esp32_web_logger's GPS integration).
+    "map": {
+        "enabled": False,
+        "size": 260,                    # px at 1080p short side -- the whole clip is just this big
+        "scale": 1.0,
+        "panel_opacity": 0.55,
+        "path_color": [120, 170, 255],
+        "traveled_color": [255, 196, 0],
+        "dot_color": [255, 255, 255],
+    },
 }
 
 FONT_CANDIDATES = [
@@ -140,7 +168,7 @@ class Log:
         self.t0 = self.t[0]
 
         self.channels = {}
-        for key in ("throttle", "brake", "steering", "speed", "rpm", "gear"):
+        for key in ("throttle", "brake", "steering", "speed", "rpm", "gear", "gps_lat", "gps_lon"):
             col = cfg[key].get("col")
             if not col or col not in rows[0]:
                 print(f"note: channel '{key}' (column '{col}') not in CSV; it will show blank", file=sys.stderr)
@@ -154,6 +182,22 @@ class Log:
                     vals.append(np.nan)     # e.g. 'N' for neutral in a gear column
             arr = np.array(vals, dtype=float)
             self.channels[key] = arr
+
+        # GPS track bounding box, for MapOverlay's static projection -- computed
+        # once here so the map doesn't rescale/jump as the drive progresses.
+        self.gps_lat = self.channels.get("gps_lat")
+        self.gps_lon = self.channels.get("gps_lon")
+        if self.gps_lat is not None and self.gps_lon is not None:
+            self.gps_ok = ~(np.isnan(self.gps_lat) | np.isnan(self.gps_lon))
+            if self.gps_ok.any():
+                self.lat_min = float(np.min(self.gps_lat[self.gps_ok]))
+                self.lat_max = float(np.max(self.gps_lat[self.gps_ok]))
+                self.lon_min = float(np.min(self.gps_lon[self.gps_ok]))
+                self.lon_max = float(np.max(self.gps_lon[self.gps_ok]))
+            else:
+                self.gps_lat = None   # column exists but every fix was invalid/blank
+        else:
+            self.gps_lat = None
 
         # wheel lockup -> ABS lamp. Reference speed is the fastest of all wheels (and the
         # car's speed), but only the lock_cols wheels (fronts) can light it, so handbrake
@@ -762,6 +806,98 @@ class ClusterHUD:
         return base
 
 
+class MapOverlay:
+    """Small top-down GPS track map: the full route drawn dim, the part driven
+    so far drawn bright, current position as a dot. Flat equirectangular
+    projection (longitude scaled by cos of the mean latitude) -- fine for the
+    few miles a single drive covers, not meant for anything bigger."""
+
+    def __init__(self, cfg, log, short_side):
+        mc = cfg.get("map", {})
+        self.k = short_side / 1080.0 * float(mc.get("scale", 1.0))
+        k = self.k
+        self.W = self.H = int(float(mc.get("size", 260)) * k)
+        self.col_path = tuple(mc.get("path_color", [120, 170, 255]))
+        self.col_traveled = tuple(mc.get("traveled_color", [255, 196, 0]))
+        self.col_dot = tuple(mc.get("dot_color", [255, 255, 255]))
+        self.panel_color = cfg["colors"]["panel"]
+        self.panel_opacity = float(mc.get("panel_opacity", 0.55))
+
+        self.log = log
+        self.have_gps = log.gps_lat is not None
+        self.base_img = Image.new("RGBA", (self.W, self.H), (0, 0, 0, 0))
+        if self.panel_opacity > 0:
+            ImageDraw.Draw(self.base_img).rounded_rectangle(
+                [0, 0, self.W - 1, self.H - 1], radius=int(16 * k),
+                fill=rgba(self.panel_color, int(255 * self.panel_opacity)))
+        if not self.have_gps:
+            return
+
+        lat, lon, ok = log.gps_lat, log.gps_lon, log.gps_ok
+
+        # The GPS module itself only produces a new fix ~1x/sec, but the CSV
+        # is logged at 20Hz (matching the CAN rate), so most rows just repeat
+        # the last fix verbatim. Collapse those down to the rows where the
+        # fix actually changed, and interpolate across THAT real interval --
+        # interpolating against the raw duplicated-row array instead would
+        # only spread each jump over one 50ms CSV tick (still an instant
+        # snap at any watchable frame rate), not the real ~1s gap.
+        changed = np.ones(len(lat), dtype=bool)
+        changed[1:] = (lat[1:] != lat[:-1]) | (lon[1:] != lon[:-1])
+        fix_idx = np.flatnonzero(ok & changed)
+        fix_t = log.t[fix_idx]
+        fix_lat = lat[fix_idx]
+        fix_lon = lon[fix_idx]
+
+        lat0 = math.radians(float(np.mean(fix_lat)))
+        xs = (fix_lon - log.lon_min) * math.cos(lat0)       # east -> +x
+        ys = (log.lat_max - fix_lat)                         # north -> -y (screen y grows down)
+
+        pad = 0.12
+        xr = max(float(np.max(xs) - np.min(xs)), 1e-9)
+        yr = max(float(np.max(ys) - np.min(ys)), 1e-9)
+        span = max(xr, yr)                                  # square aspect; center the shorter axis
+        x0 = float(np.min(xs)) - (span - xr) / 2
+        y0 = float(np.min(ys)) - (span - yr) / 2
+        inner = self.W * (1 - 2 * pad)
+        self.fix_t = fix_t
+        self.px_fix = pad * self.W + (xs - x0) / span * inner
+        self.py_fix = pad * self.H + (ys - y0) / span * inner
+
+        pts = list(zip(self.px_fix, self.py_fix))
+        if len(pts) >= 2:
+            ImageDraw.Draw(self.base_img).line(pts, fill=rgba(self.col_path, 130),
+                                               width=max(1, int(3 * k)), joint="curve")
+
+    def draw(self, t):
+        """Pure function of t -- no state carried between calls, so frames can
+        be rendered in any order/process (needed for the multiprocessing
+        render pool). Interpolates smoothly between real GPS fix timestamps
+        (self.fix_t), so motion looks fluid at any render fps even though the
+        GPS itself only updates ~1x/sec."""
+        img = self.base_img.copy()
+        if not self.have_gps:
+            return img
+
+        if t <= self.fix_t[0]:
+            x, y, n = self.px_fix[0], self.py_fix[0], 1
+        elif t >= self.fix_t[-1]:
+            x, y, n = self.px_fix[-1], self.py_fix[-1], len(self.fix_t)
+        else:
+            x = float(np.interp(t, self.fix_t, self.px_fix))
+            y = float(np.interp(t, self.fix_t, self.py_fix))
+            n = int(np.searchsorted(self.fix_t, t, side="right"))
+
+        pts = list(zip(self.px_fix[:n], self.py_fix[:n])) + [(x, y)]
+        if len(pts) >= 2:
+            ImageDraw.Draw(img).line(pts, fill=rgba(self.col_traveled, 230),
+                                     width=max(2, int(4 * self.k)), joint="curve")
+        dr = ImageDraw.Draw(img)
+        r = max(3, int(6 * self.k))
+        dr.ellipse([x - r, y - r, x + r, y + r], fill=rgba(self.col_dot))
+        return img
+
+
 def place(anchor, frame_w, frame_h, hud_w, hud_h, margin):
     left, right = margin, frame_w - hud_w - margin
     top, bottom = margin, frame_h - hud_h - margin
@@ -806,6 +942,113 @@ def resolve_start(arg, log):
         return t
 
 
+def derive_sibling_path(path, suffix):
+    """'run1_hud.mov', '_map' -> 'run1_hud_map.mov' -- used for the map's
+    default output/preview path when the user doesn't name one explicitly."""
+    root, ext = os.path.splitext(path)
+    return f"{root}{suffix}{ext}"
+
+
+# ---- parallel frame rendering (worker-process side) ----
+#
+# Frames are rendered across a pool of worker processes (always -- more
+# workers, always faster) and streamed into ffmpeg IN ORDER via pool.imap(),
+# which yields results in submission order regardless of which worker
+# finished them when. Workers need a top-level, picklable function plus
+# picklable arguments (required on Windows, which spawns rather than forks),
+# so each worker rebuilds its own Log + HUD/MapOverlay once at startup
+# (_init_worker, via Pool's initializer=/initargs=) from a small picklable
+# `job` dict, rather than trying to pickle the renderer objects themselves
+# (which hold PIL fonts etc. that don't pickle cleanly) on every frame.
+_WORKER = {}
+
+
+def _init_worker(job):
+    global _WORKER
+    log = Log(job["csv_path"], job["cfg"])
+    if job["mode"] == "map":
+        renderer = MapOverlay(job["cfg"], log, job["short"])
+    else:
+        cfg, short, font = job["cfg"], job["short"], job["font"]
+        style = cfg["layout"].get("style", "panel")
+        if style == "strip":
+            renderer = StripHUD(cfg, job["width"], short, font)
+        elif style == "cluster":
+            renderer = ClusterHUD(cfg, short, font)
+        else:
+            renderer = HUD(cfg, short, font)
+    _WORKER = {"log": log, "renderer": renderer, "job": job}
+
+
+def _render_frame(i):
+    log, renderer, job = _WORKER["log"], _WORKER["renderer"], _WORKER["job"]
+    t = job["start"] + i / job["fps"]
+
+    if job["mode"] == "map":
+        return renderer.draw(t).tobytes()
+
+    td = t - job["offset"]
+    v = {
+        "throttle": log.value("throttle", td),
+        "brake": log.value("brake", td),
+        "steering": log.value("steering", td),
+        "speed": log.value("speed", td),
+        "rpm": log.value("rpm", td),
+        "gear": log.value("gear", td, step=True),
+        "abs": log.abs_on(td),
+        "shift": log.last_shift(td),
+    }
+    flash_on = (i // max(1, int(job["fps"] / 8))) % 2 == 0
+    frame = renderer.draw(v, flash_on)
+    if job["full_frame"]:
+        canvas = Image.new("RGBA", (job["canvas_w"], job["canvas_h"]), (0, 0, 0, 0))
+        canvas.alpha_composite(frame, (job["hud_px"], job["hud_py"]))
+        frame = canvas
+    return frame.tobytes()
+
+
+def render_clip(out_path, w, h, job, n_frames, fps, fps_ff, codec, crf, bg_color, tc, workers):
+    """Encode n_frames frames to out_path, rendered across `workers` worker
+    processes (see _init_worker/_render_frame above) and written to ffmpeg's
+    stdin in order as they complete. Shared by the main HUD render and the
+    separate map render -- same codec/quality/timecode handling either way."""
+    if codec == "h264":
+        cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-f", "lavfi", "-i", f"color=size={w}x{h}:rate={fps_ff}:color={bg_color}",
+            "-f", "rawvideo", "-pix_fmt", "rgba", "-s", f"{w}x{h}", "-r", fps_ff, "-i", "-",
+            "-filter_complex", "[1:v]format=rgba[fg];[0:v][fg]overlay=x=0:y=0:shortest=1,format=yuv420p",
+            "-frames:v", str(n_frames),
+            "-c:v", "libx264", "-preset", "medium", "-crf", str(crf), "-pix_fmt", "yuv420p",
+        ]
+    else:
+        cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-f", "rawvideo", "-pix_fmt", "rgba", "-s", f"{w}x{h}", "-r", fps_ff, "-i", "-",
+            "-vf", "format=yuva444p10le",
+            "-c:v", "prores_ks", "-profile:v", "4444", "-pix_fmt", "yuva444p10le",
+            "-alpha_bits", "16", "-vendor", "apl0",
+        ]
+    if tc:
+        cmd += ["-timecode", tc]
+    cmd += [out_path]
+
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    step = max(1, int(round(fps)) * 5)
+    try:
+        with mp.Pool(processes=workers, initializer=_init_worker, initargs=(job,)) as pool:
+            for i, frame_bytes in enumerate(pool.imap(_render_frame, range(n_frames), chunksize=8)):
+                proc.stdin.write(frame_bytes)
+                if i % step == 0:
+                    print(f"  {i / fps:6.1f} s / {n_frames / fps:.1f} s", flush=True)
+    finally:
+        proc.stdin.close()
+        rc = proc.wait()
+    if rc != 0:
+        sys.exit(f"ffmpeg failed ({rc}) writing {out_path}")
+    print(f"done: {out_path}")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Render a transparent WRC-style HUD from a CSV log.")
     ap.add_argument("--csv", required=True)
@@ -826,8 +1069,29 @@ def main():
     ap.add_argument("--full-frame", action="store_true",
                     help="render a full --width x --height frame with the HUD placed by the config "
                          "(default: just the HUD panel, much faster; position it in Premiere)")
+    ap.add_argument("--map-out", help="output path for the GPS map clip (needs \"map\": {\"enabled\": true} "
+                         "in your config). Always its own separate clip -- sized to just the map panel, "
+                         "independent of --full-frame -- so you can resize/move it apart from the gauge "
+                         "cluster in your editor. Default: --out with \"_map\" inserted before the extension.")
+    ap.add_argument("--codec", choices=["prores", "h264"], default="prores",
+                    help="'prores' (default): ProRes 4444 with alpha, drop straight onto a track in "
+                         "Premiere, no chroma key -- but huge files. 'h264': small .mp4, no "
+                         "transparency (composited onto --bg-color instead) -- for a clip you just "
+                         "want to watch on a phone or a TV, not drop onto other footage.")
+    ap.add_argument("--crf", type=int, default=20,
+                    help="--codec h264 only: x264 quality (lower = better/bigger, higher = worse/smaller). "
+                         "18-23 is a reasonable range; default 20 looks clean while still being a tiny "
+                         "fraction of ProRes 4444's size.")
+    ap.add_argument("--bg-color", default="black",
+                    help="--codec h264 only: solid background color behind the HUD, since h264 can't "
+                         "do transparency. Any ffmpeg color name or 0xRRGGBB.")
+    ap.add_argument("--workers", type=int, default=os.cpu_count() or 4,
+                    help="worker processes rendering frames in parallel (default: all CPU cores). "
+                         "Frame order is preserved regardless of worker count.")
     ap.add_argument("--preview", type=float, help="render one frame at this many seconds after --start")
     ap.add_argument("--preview-out", default="hud_preview.png")
+    ap.add_argument("--map-preview-out", help="preview image for the map panel alone. "
+                         "Default: --preview-out with \"_map\" inserted before the extension.")
     ap.add_argument("--preview-bg", help="image to preview the HUD over (e.g. a screenshot of your edit)")
     args = ap.parse_args()
 
@@ -859,6 +1123,27 @@ def main():
     else:
         px, py = place(cfg["layout"].get("anchor", "bottom-left"), args.width, args.height, hud.W, hud.H, margin)
 
+    # The map is always its own separate clip (own file, own tight panel-sized
+    # frame) rather than composited onto the gauge cluster's canvas -- so it
+    # can be resized/repositioned independently of the HUD in your editor.
+    map_overlay = None
+    if cfg.get("map", {}).get("enabled"):
+        map_overlay = MapOverlay(cfg, log, short)
+        if not map_overlay.have_gps:
+            print("note: map enabled in config but no usable gps_lat/gps_lon fixes in the CSV; skipping",
+                  file=sys.stderr)
+            map_overlay = None
+
+    canvas_w, canvas_h = (args.width, args.height) if args.full_frame else (hud.W, hud.H)
+    hud_px, hud_py = (px, py) if args.full_frame else (0, 0)
+
+    def build_frame(t, flash_on):
+        if args.full_frame:
+            frame = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+            frame.alpha_composite(hud.draw(values_at(t), flash_on), (hud_px, hud_py))
+            return frame
+        return hud.draw(values_at(t), flash_on)
+
     def values_at(t):
         td = t - args.offset
         return {
@@ -872,9 +1157,6 @@ def main():
             "shift": log.last_shift(td),
         }
 
-    def flash(i):
-        return (i // max(1, int(fps / 8))) % 2 == 0     # ~4 Hz shift-light flash
-
     # ---- single-frame preview (composited on gray so you can see it)
     if args.preview is not None:
         t = start + args.preview
@@ -882,9 +1164,16 @@ def main():
             frame = Image.open(args.preview_bg).convert("RGBA").resize((args.width, args.height), Image.LANCZOS)
         else:
             frame = Image.new("RGBA", (args.width, args.height), (70, 74, 80, 255))
-        frame.alpha_composite(hud.draw(values_at(t), True), (px, py))
+        overlay = build_frame(t, True)
+        frame.alpha_composite(overlay, (0, 0) if args.full_frame else (px, py))
         frame.convert("RGB").save(args.preview_out)
         print(f"preview written: {args.preview_out}")
+        if map_overlay:
+            map_preview_out = args.map_preview_out or derive_sibling_path(args.preview_out, "_map")
+            map_bg = Image.new("RGBA", (map_overlay.W, map_overlay.H), (70, 74, 80, 255))
+            map_bg.alpha_composite(map_overlay.draw(t))
+            map_bg.convert("RGB").save(map_preview_out)
+            print(f"map preview written: {map_preview_out}")
         return
 
     if not shutil.which("ffmpeg"):
@@ -896,36 +1185,24 @@ def main():
     elif args.timecode not in ("auto", "none"):
         tc = args.timecode
 
-    cmd = [
-        "ffmpeg", "-y", "-loglevel", "error",
-        "-f", "rawvideo", "-pix_fmt", "rgba", "-s", f"{hud.W}x{hud.H}", "-r", fps_ff, "-i", "-",
-    ]
-    if not args.full_frame:
-        cmd += ["-vf", "format=yuva444p10le"]          # small clip; position it in Premiere
-    else:
-        cmd += ["-vf", f"pad={args.width}:{args.height}:{px}:{py}:color=black@0,format=yuva444p10le"]
-    cmd += ["-c:v", "prores_ks", "-profile:v", "4444", "-pix_fmt", "yuva444p10le",
-            "-alpha_bits", "16", "-vendor", "apl0"]
-    if tc:
-        cmd += ["-timecode", tc]
-    cmd += [args.out]
+    hud_job = {
+        "mode": "hud", "csv_path": args.csv, "cfg": cfg, "short": short, "font": font,
+        "width": args.width, "start": start, "fps": fps, "offset": args.offset,
+        "full_frame": args.full_frame, "canvas_w": canvas_w, "canvas_h": canvas_h,
+        "hud_px": hud_px, "hud_py": hud_py,
+    }
+    print(f"rendering {n_frames} frames @ {fps:.3f} fps ({n_frames / fps:.1f} s) "
+          f"across {args.workers} workers" + (f", timecode {tc}" if tc else ""))
+    render_clip(args.out, canvas_w, canvas_h, hud_job, n_frames, fps, fps_ff,
+                args.codec, args.crf, args.bg_color, tc, args.workers)
 
-    print(f"rendering {n_frames} frames @ {fps:.3f} fps ({n_frames / fps:.1f} s)"
-          + (f", timecode {tc}" if tc else ""))
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-    step = max(1, int(round(fps)) * 5)
-    try:
-        for i in range(n_frames):
-            t = start + i / fps
-            proc.stdin.write(hud.draw(values_at(t), flash(i)).tobytes())
-            if i % step == 0:
-                print(f"  {i / fps:6.1f} s / {n_frames / fps:.1f} s", flush=True)
-    finally:
-        proc.stdin.close()
-        rc = proc.wait()
-    if rc != 0:
-        sys.exit(f"ffmpeg failed ({rc})")
-    print(f"done: {args.out}")
+    if map_overlay:
+        map_out = args.map_out or derive_sibling_path(args.out, "_map")
+        map_job = {"mode": "map", "csv_path": args.csv, "cfg": cfg, "short": short, "start": start, "fps": fps}
+        print(f"rendering map: {n_frames} frames @ {fps:.3f} fps ({n_frames / fps:.1f} s) "
+              f"across {args.workers} workers")
+        render_clip(map_out, map_overlay.W, map_overlay.H, map_job, n_frames, fps, fps_ff,
+                    args.codec, args.crf, args.bg_color, tc, args.workers)
 
 
 if __name__ == "__main__":

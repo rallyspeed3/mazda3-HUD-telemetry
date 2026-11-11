@@ -1,4 +1,5 @@
 #include "can_task.h"
+#include "gps_task.h"
 #include "driver/twai.h"
 #include "FFat.h"
 #include <time.h>
@@ -12,6 +13,12 @@ static const uint32_t TARGET_IDS[] = {0x201, 0x20F, 0x4B0, 0x231, 0x433, 0x082};
 static const int NUM_IDS = sizeof(TARGET_IDS) / sizeof(TARGET_IDS[0]);
 static const float KMH_TO_MPH = 0.621371f;
 static const float LOG_RATE_HZ = 20.0f;   // matches tools/record_drive.py's default --rate
+
+// Offset from UTC used ONLY for naming log files (the board's clock itself
+// stays true UTC internally -- see CANTask_SetWallClock()). Fixed, no DST
+// auto-adjustment -- edit this if you move out of Central Standard Time, or
+// flip it when CDT is in effect.
+static const long LOCAL_TZ_OFFSET_SEC = -6 * 3600;   // CST (UTC-6), southern Oklahoma
 
 static bool is_target_id(uint32_t id) {
     for (int i = 0; i < NUM_IDS; i++) {
@@ -87,14 +94,30 @@ static bool isAllDigits(const String& s) {
 
 static String makeLogName(uint32_t fallbackId) {
     if (g_wallClockSet) {
-        time_t now = time(nullptr);
+        time_t utcNow = time(nullptr);
+        time_t localNow = utcNow + LOCAL_TZ_OFFSET_SEC;
         struct tm t;
-        localtime_r(&now, &t);
-        char buf[32];
-        strftime(buf, sizeof(buf), "/log_%Y-%m-%d_%H-%M-%S.csv", &t);
+        gmtime_r(&localNow, &t);   // gmtime_r, not localtime_r -- the offset above is already applied by hand
+
+        char base[40];
+        // FAT filesystems don't allow ':' in filenames, so "HH:MM" becomes
+        // "HH.MM" here instead -- otherwise FFat.open() below would just fail.
+        // No ".csv" yet -- kept separate so " (2)" etc. can be inserted before it.
+        strftime(base, sizeof(base), "/%m-%d-%Y-%I.%M%p", &t);
+
+        char buf[48];
+        snprintf(buf, sizeof(buf), "%s.csv", base);
         if (!FFat.exists(buf)) return String(buf);
-        // Two recordings started in the same second -- vanishingly unlikely,
-        // but fall through to the numeric scheme below rather than overwrite.
+
+        // This exact minute is already taken -- a start/stop/start within
+        // the same minute. Try "(2)", "(3)", ... rather than silently
+        // falling back to the old numeric log_00007.csv scheme.
+        for (int n = 2; n <= 99; n++) {
+            snprintf(buf, sizeof(buf), "%s (%d).csv", base, n);
+            if (!FFat.exists(buf)) return String(buf);
+        }
+        // 99 recordings in the same minute -- give up and fall through to
+        // the numeric scheme below rather than loop forever.
     }
     char buf[24];
     snprintf(buf, sizeof(buf), "/log_%05u.csv", (unsigned)fallbackId);
@@ -132,7 +155,7 @@ String CANTask_StartRecording() {
     if (!f) return "";
 
     f.print("time,throttle,brake,steering_deg,speed,rpm,gear,gear_raw,"
-            "wheel_fl,wheel_fr,wheel_rl,wheel_rr\n");
+            "wheel_fl,wheel_fr,wheel_rl,wheel_rr,gps_lat,gps_lon,gps_speed,gps_valid\n");
 
     File marker = FFat.open(ACTIVE_MARKER_PATH, FILE_WRITE);
     if (marker) {
@@ -278,15 +301,17 @@ static void canTaskLoop(void* pvParameters) {
 
         if (g_recording && millis() >= next_tick_ms) {
             Telemetry t = CANTask_GetTelemetry();
+            GpsFix gps = GpsTask_GetFix();
             int display_gear = t.reverse ? -1 : t.gear;
             float row_time = (next_tick_ms - t0_ms) / 1000.0f;
 
-            char line[200];
+            char line[260];
             snprintf(line, sizeof(line),
-                      "%.3f,%.1f,%u,%.1f,%.1f,%u,%d,0x%02X,%.1f,%.1f,%.1f,%.1f\n",
+                      "%.3f,%.1f,%u,%.1f,%.1f,%u,%d,0x%02X,%.1f,%.1f,%.1f,%.1f,%.6f,%.6f,%.1f,%d\n",
                       row_time, t.throttle, (unsigned)t.brake, t.steering_deg,
                       t.speed, (unsigned)t.rpm, display_gear, t.gear_raw,
-                      t.wheel_fl, t.wheel_fr, t.wheel_rl, t.wheel_rr);
+                      t.wheel_fl, t.wheel_fr, t.wheel_rl, t.wheel_rr,
+                      gps.lat, gps.lon, gps.speed_mph, gps.valid ? 1 : 0);
             g_logFile.print(line);
             g_logRows++;
             if (g_logRows % (uint32_t)LOG_RATE_HZ == 0) {

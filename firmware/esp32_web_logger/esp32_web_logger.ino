@@ -23,8 +23,10 @@
 // hud_overlay/render_overlay.py, unmodified.
 #include <WiFi.h>
 #include <WebServer.h>
+#include <time.h>
 #include "FFat.h"
 #include "can_task.h"
+#include "gps_task.h"
 #include "web_ui.h"
 
 // Change these if you want -- WPA2 passwords need to be 8+ characters.
@@ -61,21 +63,24 @@ void handleRoot() {
 
 void handleLive() {
     Telemetry t = CANTask_GetTelemetry();
+    GpsFix gps = GpsTask_GetFix();
     bool recording = CANTask_IsRecording();
     String logName = CANTask_CurrentLogName();
     logName.replace("/", "");
 
-    char buf[420];
+    char buf[520];
     snprintf(buf, sizeof(buf),
         "{\"recording\":%s,\"log_name\":\"%s\",\"log_rows\":%u,"
         "\"rpm\":%u,\"throttle\":%.1f,\"brake\":%u,\"speed\":%.1f,"
         "\"steering\":%.1f,\"gear\":%d,\"reverse\":%s,\"handbrake\":%s,"
         "\"wheel_fl\":%.1f,\"wheel_fr\":%.1f,\"wheel_rl\":%.1f,\"wheel_rr\":%.1f,"
+        "\"gps_valid\":%s,\"gps_lat\":%.6f,\"gps_lon\":%.6f,\"gps_speed\":%.1f,"
         "\"updates\":%u}",
         recording ? "true" : "false", logName.c_str(), (unsigned)CANTask_CurrentLogRows(),
         (unsigned)t.rpm, t.throttle, (unsigned)t.brake, t.speed,
         t.steering_deg, t.gear, t.reverse ? "true" : "false", t.handbrake ? "true" : "false",
         t.wheel_fl, t.wheel_fr, t.wheel_rl, t.wheel_rr,
+        gps.valid ? "true" : "false", gps.lat, gps.lon, gps.speed_mph,
         (unsigned)t.updates);
 
     server.sendHeader("Cache-Control", "no-store");
@@ -116,19 +121,21 @@ void handleRecordStop() {
     server.send(200, "application/json", "{\"ok\":true}");
 }
 
-// Called by the web page on load, with the browser's own clock. First
-// caller for this boot wins -- see CANTask_SetWallClock()'s comment in
-// can_task.h. After this succeeds, new logs get real dated filenames
-// instead of "log_00007.csv".
+// Called by the web page on load, with the browser's own clock (as epoch
+// milliseconds -- always UTC, unlike Y/M/D/h/m/s fields which would be in
+// whatever timezone the phone/laptop is set to). First caller for this boot
+// wins -- see CANTask_SetWallClock()'s comment in can_task.h. After this
+// succeeds, new logs get real dated filenames instead of "log_00007.csv".
 void handleSetTime() {
-    if (!server.hasArg("y") || !server.hasArg("mo") || !server.hasArg("d") ||
-        !server.hasArg("h") || !server.hasArg("mi") || !server.hasArg("s")) {
-        sendJsonError("missing time fields");
+    if (!server.hasArg("epoch_ms")) {
+        sendJsonError("missing epoch_ms");
         return;
     }
+    time_t epochSec = (time_t)(server.arg("epoch_ms").toDouble() / 1000.0);
+    struct tm t;
+    gmtime_r(&epochSec, &t);
     bool applied = CANTask_SetWallClock(
-        server.arg("y").toInt(), server.arg("mo").toInt(), server.arg("d").toInt(),
-        server.arg("h").toInt(), server.arg("mi").toInt(), server.arg("s").toInt());
+        t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
     server.send(200, "application/json",
                 String("{\"ok\":true,\"applied\":") + (applied ? "true" : "false") + "}");
 }
@@ -214,6 +221,7 @@ void setup() {
     delay(300);
 
     CANTask_Init();
+    GpsTask_Init();
 
     WiFi.mode(WIFI_AP);
     WiFi.setSleep(false);   // modem sleep saves power but adds latency/drops that can look like a dead AP to clients
