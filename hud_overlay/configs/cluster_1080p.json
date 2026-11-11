@@ -22,7 +22,7 @@
   "rpm": {
     "col": "rpm",
     "max": 7000,
-    "limiter": 6500
+    "limiter": 6200
   },
   "gear": {
     "col": "gear",
