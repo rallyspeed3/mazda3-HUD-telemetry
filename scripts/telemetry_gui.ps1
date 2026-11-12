@@ -1,5 +1,6 @@
 <#
-Launches the Tkinter GUI for rendering HUD overlay videos.
+Launches the Tkinter telemetry GUI (render HUD overlay videos, export VBO
+for lap-analysis tools).
 #>
 
 $ErrorActionPreference = "Stop"
