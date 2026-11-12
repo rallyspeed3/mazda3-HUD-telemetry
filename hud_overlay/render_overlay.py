@@ -85,6 +85,7 @@ DEFAULT_CONFIG = {
     "wheel_image": None,               # optional PNG of your own wheel (top of rim up, transparent background)
     "gps_lat": {"col": "gps_lat"},
     "gps_lon": {"col": "gps_lon"},
+    "gps_valid": {"col": "gps_valid"},
     # Small top-down GPS track map, always rendered as its own separate clip
     # (see --map-out) so it can be resized/repositioned independently of the
     # gauge cluster in your editor. Off by default -- set "enabled": true in
@@ -192,7 +193,32 @@ class Log:
             t, a = parse_time_value(r[tcol])
             times.append(t)
             absolute = a if absolute is None else absolute
-        self.t = np.array(times, dtype=float)
+        raw_t = np.array(times, dtype=float)
+
+        if not absolute:
+            # A relative (seconds-since-boot) time column restarts near 0 if the logger
+            # resets mid-recording (see "recording survives a reset"): without this, the
+            # restarted segment's rows interleave/overlap with the prior segment's once
+            # sorted, scrambling both the gauge readouts and the GPS track. Detect each
+            # backward jump and shift that segment (and everything after it) forward so
+            # the whole log becomes one continuous, monotonic timeline.
+            diffs = np.diff(raw_t)
+            normal = diffs[diffs > 0]
+            step = float(np.median(normal)) if normal.size else 0.0
+            self.t = raw_t.copy()
+            offset = 0.0
+            n_resets = 0
+            for i in range(1, len(self.t)):
+                if raw_t[i] + offset <= self.t[i - 1]:
+                    offset = self.t[i - 1] + step - raw_t[i]
+                    n_resets += 1
+                self.t[i] += offset
+            if n_resets:
+                print(f"note: '{tcol}' restarted {n_resets} time(s) mid-recording (logger reset); "
+                      f"stitched into one continuous timeline", file=sys.stderr)
+        else:
+            self.t = raw_t
+
         order = np.argsort(self.t, kind="stable")
         self.t = self.t[order]
         rows = [rows[i] for i in order]
@@ -200,7 +226,8 @@ class Log:
         self.t0 = self.t[0]
 
         self.channels = {}
-        for key in ("throttle", "brake", "steering", "speed", "rpm", "gear", "gps_lat", "gps_lon"):
+        for key in ("throttle", "brake", "steering", "speed", "rpm", "gear",
+                    "gps_lat", "gps_lon", "gps_valid"):
             col = cfg[key].get("col")
             if not col or col not in rows[0]:
                 print(f"note: channel '{key}' (column '{col}') not in CSV; it will show blank", file=sys.stderr)
@@ -219,8 +246,15 @@ class Log:
         # once here so the map doesn't rescale/jump as the drive progresses.
         self.gps_lat = self.channels.get("gps_lat")
         self.gps_lon = self.channels.get("gps_lon")
+        gps_valid = self.channels.get("gps_valid")
         if self.gps_lat is not None and self.gps_lon is not None:
             self.gps_ok = ~(np.isnan(self.gps_lat) | np.isnan(self.gps_lon))
+            if gps_valid is not None:
+                # a 'gps_valid' column marks fixes the GPS module itself flagged bad (e.g.
+                # logged as literal 0,0 rather than blank) -- NaN-checking alone misses those,
+                # which would otherwise blow out the map's bounding box to span the whole
+                # globe and squash the real route down to an invisible sliver.
+                self.gps_ok &= np.nan_to_num(gps_valid, nan=0.0) != 0
             if self.gps_ok.any():
                 self.lat_min = float(np.min(self.gps_lat[self.gps_ok]))
                 self.lat_max = float(np.max(self.gps_lat[self.gps_ok]))
@@ -842,16 +876,51 @@ class ClusterHUD:
         return base
 
 
+def _smooth_track(px, py, t, samples_per_seg=10):
+    """Catmull-Rom spline through the sparse (~1 fix/sec) GPS points,
+    resampled densely so turns read as a curve instead of a dot-to-dot
+    polyline. Returns (smoothed_px, smoothed_py, smoothed_t); the time basis
+    stays monotonic with the input fixes, so interpolation-by-time still
+    works on the result."""
+    n = len(px)
+    if n < 3:
+        return px, py, t
+    P = np.stack([px, py], axis=1)
+    pts, times = [], []
+    for i in range(n - 1):
+        p0 = P[i - 1] if i > 0 else P[i]
+        p1, p2 = P[i], P[i + 1]
+        p3 = P[i + 2] if i + 2 < n else P[i + 1]
+        t0, t1 = t[i], t[i + 1]
+        for s in range(samples_per_seg):
+            f = s / samples_per_seg
+            f2, f3 = f * f, f * f * f
+            out = 0.5 * ((2 * p1) + (-p0 + p2) * f +
+                         (2 * p0 - 5 * p1 + 4 * p2 - p3) * f2 +
+                         (-p0 + 3 * p1 - 3 * p2 + p3) * f3)
+            pts.append(out)
+            times.append(t0 + f * (t1 - t0))
+    pts.append(P[-1])
+    times.append(t[-1])
+    pts = np.array(pts)
+    return pts[:, 0], pts[:, 1], np.array(times)
+
+
 class MapOverlay:
     """Small top-down GPS track map: the full route drawn dim, the part driven
-    so far drawn bright, current position as a dot. Flat equirectangular
-    projection (longitude scaled by cos of the mean latitude) -- fine for the
-    few miles a single drive covers, not meant for anything bigger."""
+    so far drawn bright with a soft glow, current position a glowing dot.
+    Flat equirectangular projection (longitude scaled by cos of the mean
+    latitude) -- fine for the few miles a single drive covers, not meant for
+    anything bigger. Rendered supersampled (SS) then downsampled so the
+    smoothed path comes out anti-aliased instead of jagged."""
+
+    SS = 4   # supersample factor for anti-aliasing
 
     def __init__(self, cfg, log, short_side):
         mc = cfg.get("map", {})
         self.k = short_side / 1080.0 * float(mc.get("scale", 1.0))
         k = self.k
+        ss = self.SS
         self.W = self.H = int(float(mc.get("size", 260)) * k)
         self.col_path = tuple(mc.get("path_color", [120, 170, 255]))
         self.col_traveled = tuple(mc.get("traveled_color", [255, 196, 0]))
@@ -861,10 +930,11 @@ class MapOverlay:
 
         self.log = log
         self.have_gps = log.gps_lat is not None
-        self.base_img = Image.new("RGBA", (self.W, self.H), (0, 0, 0, 0))
+        S = self.W * ss
+        self.base_img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
         if self.panel_opacity > 0:
             ImageDraw.Draw(self.base_img).rounded_rectangle(
-                [0, 0, self.W - 1, self.H - 1], radius=int(16 * k),
+                [0, 0, S - 1, S - 1], radius=int(16 * k * ss),
                 fill=rgba(self.panel_color, int(255 * self.panel_opacity)))
         if not self.have_gps:
             return
@@ -895,43 +965,65 @@ class MapOverlay:
         span = max(xr, yr)                                  # square aspect; center the shorter axis
         x0 = float(np.min(xs)) - (span - xr) / 2
         y0 = float(np.min(ys)) - (span - yr) / 2
-        inner = self.W * (1 - 2 * pad)
-        self.fix_t = fix_t
-        self.px_fix = pad * self.W + (xs - x0) / span * inner
-        self.py_fix = pad * self.H + (ys - y0) / span * inner
+        inner = S * (1 - 2 * pad)
+        px = pad * S + (xs - x0) / span * inner
+        py = pad * S + (ys - y0) / span * inner
 
-        pts = list(zip(self.px_fix, self.py_fix))
-        if len(pts) >= 2:
-            ImageDraw.Draw(self.base_img).line(pts, fill=rgba(self.col_path, 130),
-                                               width=max(1, int(3 * k)), joint="curve")
+        # Smooth the sparse fixes into a dense curve (so turns read as a
+        # curve, not a dot-to-dot polyline), then draw the dim full route
+        # and a small ring at the start once -- both static for the whole clip.
+        self.px_fix, self.py_fix, self.fix_t = _smooth_track(px, py, fix_t)
+        if len(self.px_fix) >= 2:
+            pts = list(zip(self.px_fix, self.py_fix))
+            ImageDraw.Draw(self.base_img).line(pts, fill=rgba(self.col_path, 110),
+                                               width=max(1, int(2.5 * k * ss)), joint="curve")
+            sx, sy = self.px_fix[0], self.py_fix[0]
+            r0 = max(1, int(3 * k * ss))
+            ImageDraw.Draw(self.base_img).ellipse(
+                [sx - r0, sy - r0, sx + r0, sy + r0],
+                outline=rgba((200, 210, 230), 180), width=max(1, ss))
 
     def draw(self, t):
         """Pure function of t -- no state carried between calls, so frames can
         be rendered in any order/process (needed for the multiprocessing
         render pool). Interpolates smoothly between real GPS fix timestamps
         (self.fix_t), so motion looks fluid at any render fps even though the
-        GPS itself only updates ~1x/sec."""
+        GPS itself only updates ~1x/sec. Renders at SS then downsamples, so
+        the glow/line/dot all come out anti-aliased."""
+        ss, k = self.SS, self.k
         img = self.base_img.copy()
-        if not self.have_gps:
-            return img
+        if self.have_gps and len(self.px_fix) >= 2:
+            if t <= self.fix_t[0]:
+                x, y, n = self.px_fix[0], self.py_fix[0], 1
+            elif t >= self.fix_t[-1]:
+                x, y, n = self.px_fix[-1], self.py_fix[-1], len(self.fix_t)
+            else:
+                x = float(np.interp(t, self.fix_t, self.px_fix))
+                y = float(np.interp(t, self.fix_t, self.py_fix))
+                n = int(np.searchsorted(self.fix_t, t, side="right"))
 
-        if t <= self.fix_t[0]:
-            x, y, n = self.px_fix[0], self.py_fix[0], 1
-        elif t >= self.fix_t[-1]:
-            x, y, n = self.px_fix[-1], self.py_fix[-1], len(self.fix_t)
-        else:
-            x = float(np.interp(t, self.fix_t, self.px_fix))
-            y = float(np.interp(t, self.fix_t, self.py_fix))
-            n = int(np.searchsorted(self.fix_t, t, side="right"))
+            tp = list(zip(self.px_fix[:n], self.py_fix[:n])) + [(x, y)]
+            if len(tp) >= 2:
+                # Soft glow under the traveled trail: draw it bright on its
+                # own layer, blur that layer, then composite it under a
+                # crisp re-stroke of the same line on top.
+                glow = Image.new("RGBA", img.size, (0, 0, 0, 0))
+                ImageDraw.Draw(glow).line(tp, fill=rgba(self.col_traveled, 255),
+                                          width=max(2, int(5 * k * ss)), joint="curve")
+                glow = glow.filter(ImageFilter.GaussianBlur(radius=3 * k * ss))
+                img = Image.alpha_composite(img, glow)
+                ImageDraw.Draw(img).line(tp, fill=rgba(self.col_traveled, 235),
+                                         width=max(1, int(3.4 * k * ss)), joint="curve")
 
-        pts = list(zip(self.px_fix[:n], self.py_fix[:n])) + [(x, y)]
-        if len(pts) >= 2:
-            ImageDraw.Draw(img).line(pts, fill=rgba(self.col_traveled, 230),
-                                     width=max(2, int(4 * self.k)), joint="curve")
-        dr = ImageDraw.Draw(img)
-        r = max(3, int(6 * self.k))
-        dr.ellipse([x - r, y - r, x + r, y + r], fill=rgba(self.col_dot))
-        return img
+            ring = Image.new("RGBA", img.size, (0, 0, 0, 0))
+            rr = max(4, int(11 * k * ss))
+            ImageDraw.Draw(ring).ellipse([x - rr, y - rr, x + rr, y + rr], fill=rgba(self.col_dot, 90))
+            ring = ring.filter(ImageFilter.GaussianBlur(radius=2.5 * k * ss))
+            img = Image.alpha_composite(img, ring)
+            r = max(2, int(5.5 * k * ss))
+            ImageDraw.Draw(img).ellipse([x - r, y - r, x + r, y + r], fill=rgba(self.col_dot, 255),
+                                        outline=rgba(self.panel_color, 220), width=max(1, int(1.2 * ss)))
+        return img.resize((self.W, self.H), Image.LANCZOS)
 
 
 def place(anchor, frame_w, frame_h, hud_w, hud_h, margin):
