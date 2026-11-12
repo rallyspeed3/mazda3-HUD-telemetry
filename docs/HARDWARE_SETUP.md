@@ -133,6 +133,45 @@ See the main [README](../README.md) for `esp32_web_logger.ino`'s
 standalone WiFi logging feature -- ESP32-only, no Arduino Uno
 equivalent.
 
+## Optional: GPS module (ESP32 only)
+
+Adds `gps_lat`/`gps_lon`/`gps_speed`/`gps_valid` columns to
+`esp32_web_logger`'s recordings, which unlock the renderer's GPS track
+map and the `tools/csv_to_vbo.py` lap-analysis export. No Arduino Uno
+equivalent -- the Uno has no spare UART for it.
+
+### What you need
+
+- A **Beitian GN-880/BN-880 GPS module** (common, cheap, speaks NMEA
+  0183 at 9600 baud by default).
+
+### Wiring
+
+The board's P1 header has two free GPIO pins for this -- GPIO15/GPIO16
+are already tied to the onboard CAN transceiver, so they're not
+available.
+
+| GN-880/BN-880 pin | ESP32 pin |
+|---|---|
+| TX | GPIO1 (ESP32 RX) |
+| RX | GPIO2 (ESP32 TX) |
+| VCC | 3V3 |
+| GND | GND |
+
+Cross TX/RX -- the module's TX feeds the chip's RX and vice versa.
+
+### Confirming it works
+
+Flash `firmware/esp32_gps_test/esp32_gps_test.ino` and open a serial
+monitor at 115200 baud -- it relays the GPS's raw NMEA sentences
+straight through, so you can confirm wiring and baud rate before
+building anything on top of it. A first fix can take a minute or two
+outdoors with a clear view of the sky; if nothing prints, double-check
+TX/RX aren't swapped.
+
+Once confirmed, flash `esp32_web_logger.ino` as usual (see Option B
+above) -- it picks the GPS up automatically, no extra configuration.
+
 ## Software setup (both boards)
 
 1. Install Python 3.9 or newer from
@@ -218,3 +257,22 @@ you've got plugged in.
 
 - Most signals (and always `steering_deg`) need the engine running, not
   just key-on. Try key-on-engine-running, not just accessory mode.
+
+### GPS module
+
+**No NMEA output from `esp32_gps_test.ino`:**
+
+- **TX/RX swapped.** Double-check against the wiring table above --
+  easy to mix up since the module's TX goes to the board's RX pin, not
+  its TX pin.
+- **No sky view yet.** A first fix can take a minute or two outdoors;
+  it won't print anything useful stuck indoors or in a garage.
+- **USB CDC On Boot not enabled** -- same requirement as every other
+  ESP32 sketch here, see above.
+
+**`esp32_web_logger` recordings have no `gps_lat`/`gps_lon` columns:**
+
+- The GPS module wasn't wired in (or wasn't confirmed working with
+  `esp32_gps_test.ino`) when that recording was made. Older recordings
+  made before you added the GPS module will never have these columns;
+  that's expected, not a bug.

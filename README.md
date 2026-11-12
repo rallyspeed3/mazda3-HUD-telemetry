@@ -1,14 +1,22 @@
-# Mazda3 HUD Telemetry
+# Mazda3 Telemetry Toolkit
 
 Tools for reading real-time driving data (RPM, speed, throttle, brake,
-steering angle, gear) straight off a 2013 Mazdaspeed3's CAN bus -- no
-paid scan tool, no dealer software. Works with **either an Arduino Uno +
-a $10 MCP2515 module, or an ESP32-S3 board with CAN built in** -- pick
-whichever you've already got. Built for recording driving data and
-turning it into a transparent video overlay (throttle/brake bars, a
-rotating steering wheel, gear indicator) to drop onto dash-cam or
-track-day footage; the ESP32 path can also run fully standalone in the
-car, no laptop required.
+steering angle, gear, and optionally GPS position) straight off a 2013
+Mazdaspeed3's CAN bus -- no paid scan tool, no dealer software. Works
+with **either an Arduino Uno + a $10 MCP2515 module, or an ESP32-S3 board
+with CAN built in** -- pick whichever you've already got; the ESP32 path
+can also run fully standalone in the car, no laptop required, and adds
+GPS logging.
+
+A recorded drive (CSV) can then become:
+- a **transparent video overlay** (throttle/brake bars, a rotating
+  steering wheel, gear indicator, and an optional GPS track map) to drop
+  onto dash-cam or track-day footage,
+- or a **RaceLogic `.vbo` file** for a free lap-analysis tool (Track Data
+  Analysis, Harry's LapTimer/onTrackTools, Trackday Plot, ...),
+
+either from the command line or from a point-and-click **Tkinter GUI**
+that wraps both -- no typing required.
 
 **I (the repo owner) take zero credit for the code itself -- this whole
 project, every script and every microcontroller sketch in this repo, was
@@ -38,20 +46,26 @@ CAN buses on other cars.**
 
 ## Which hardware do I need?
 
-Either works with every tool in this repo -- see the comparison table in
-[`docs/HARDWARE_SETUP.md`](docs/HARDWARE_SETUP.md) if you're deciding
-between them. Short version: Arduino Uno + MCP2515 is cheaper and
-simpler if you just want to log drives with a laptop; the ESP32-S3 board
-has CAN built in (no extra module) and can run standalone with its own
-WiFi web UI and onboard logging, no laptop needed once it's set up.
+Either works with every CAN tool in this repo -- see the comparison
+table in [`docs/HARDWARE_SETUP.md`](docs/HARDWARE_SETUP.md) if you're
+deciding between them. Short version: Arduino Uno + MCP2515 is cheaper
+and simpler if you just want to log drives with a laptop; the ESP32-S3
+board has CAN built in (no extra module) and can run standalone with
+its own WiFi web UI and onboard logging, no laptop needed once it's set
+up -- and it's the only option that supports [GPS
+logging](#optional-gps-logging).
 
 ## What's in here
 
 ```
 firmware/        Microcontroller sketches -- Arduino Uno + MCP2515 ones,
                  and esp32_-prefixed ones for the ESP32-S3 (flash ONE at a time)
-tools/           Python scripts that talk to either board over serial
-hud_overlay/     Turns a recorded drive into a transparent overlay video
+tools/           Python scripts that talk to either board over serial,
+                 plus csv_to_vbo.py (CSV -> lap-analysis VBO export)
+hud_overlay/     Turns a recorded drive into a transparent overlay video,
+                 with an optional GPS track map
+gui/             Point-and-click Tkinter GUI for rendering a video or
+                 exporting a VBO file -- no command line needed
 scripts/         Double-click Windows tools -- no typing required
 docs/            Setup guide (both boards), confirmed signal reference, GitHub guide
 examples/        A real (short) sample drive log to test the renderer with
@@ -67,6 +81,7 @@ these in the [`scripts/`](scripts/) folder instead:
 | `watch_live.bat` | Connects to your board and shows live data on screen -- good for checking your wiring before you drive. Nothing is saved. |
 | `start_logging.bat` | Connects to your board and records your drive to a timestamped CSV in a new `recordings/` folder. Press Ctrl+C in the window when you're done driving. |
 | `render_video.bat` | Picks a recording from `recordings/` (or any CSV you point it at) and turns it into a transparent overlay video, horizontal or vertical. |
+| `telemetry_gui.bat` | Opens a window with two tabs -- **Render video** (same as `render_video.bat`, point-and-click) and **Export VBO** (turn a GPS-logged CSV into a `.vbo` file for a lap-analysis tool). |
 
 Each one finds your board's COM port automatically, or asks you to pick
 it if there's more than one device plugged in. You still need to have
@@ -91,7 +106,9 @@ directly if you'd rather type commands or you're not on Windows.
 | Find which diagnostic modules exist on my car | `uds_bridge/uds_bridge.ino` (Arduino) or `esp32_uds_bridge/esp32_uds_bridge.ino` (ESP32) | `python tools/discover_modules.py --port COM6` |
 | Hunt for new DIDs on a known module | same as above | `python tools/discover_dids.py --port COM6` |
 | Turn a recorded CSV into an overlay video | *(no board needed)* | `python hud_overlay/render_overlay.py --csv my_drive.csv --config hud_overlay/configs/horizontal_1080p.json --out my_drive_hud.mov` |
-| Log standalone, no laptop, with a web UI | `esp32_web_logger/esp32_web_logger.ino` (**ESP32 only**) | nothing -- it's a web page, see below |
+| Export a GPS-logged CSV for a lap-analysis tool | *(no board needed -- CSV needs GPS columns, see below)* | `python tools/csv_to_vbo.py --csv my_drive.csv` |
+| Log standalone, no laptop, with a web UI (+ optional GPS) | `esp32_web_logger/esp32_web_logger.ino` (**ESP32 only**) | nothing -- it's a web page, see below |
+| Do any of the above without typing commands | *(same firmware as above)* | `gui/app.py`, or double-click `scripts/telemetry_gui.bat` |
 
 All `firmware/` sketches live in `firmware/<name>/<name>.ino` (e.g.
 `firmware/can_live/can_live.ino`). Your board can only run one sketch at
@@ -190,6 +207,61 @@ python hud_overlay/render_overlay.py --csv my_drive.csv \
     --preview 12.5 --preview-out frame.png
 ```
 
+## GPS track map overlay
+
+If your CSV has `gps_lat`/`gps_lon` columns (only `esp32_web_logger`'s
+standalone logging produces these -- see below), the renderer can also
+draw a small top-down map: the full route dim, the part driven so far
+glowing, current position a glowing dot. It's rendered as its own
+separate transparent clip (so you can resize/reposition it in your
+editor independently of the gauge cluster), not baked into the main HUD
+clip.
+
+Turn it on in your config:
+
+```json
+"map": { "enabled": true, "size": 260, "scale": 1.0 }
+```
+
+or point `--map-out` at a path to render it even if the config has it
+disabled:
+
+```bash
+python hud_overlay/render_overlay.py --csv my_drive.csv \
+    --config hud_overlay/configs/cluster_1080p.json \
+    --out my_drive_hud.mov --map-out my_drive_map.mov
+```
+
+The GUI's **Render video** tab has an "Include GPS map clip" checkbox
+that does the same thing without editing the config file.
+
+## Lap analysis export (VBO)
+
+`tools/csv_to_vbo.py` converts a GPS-logged CSV into a RaceLogic `.vbo`
+file, so you can run lap analysis in a free tool (Track Data Analysis,
+Harry's LapTimer/onTrackTools, Trackday Plot, ...) instead of only this
+project's own HUD renderer. Also needs `gps_lat`/`gps_lon` columns, so --
+same as the map overlay -- it only works on a CSV from
+`esp32_web_logger`'s standalone logging.
+
+```bash
+python tools/csv_to_vbo.py --csv my_drive.csv
+# writes my_drive.vbo next to it
+```
+
+If the CSV's filename doesn't encode a wall-clock start time (the
+ESP32's clock was never set for that recording), pass the real start
+time yourself:
+
+```bash
+python tools/csv_to_vbo.py --csv my_drive.csv --start-utc 2026-11-11T23:05:00Z
+```
+
+Run `python tools/csv_to_vbo.py --help` for the full option list (the
+script's own docstring covers the exact `.vbo` format and the handful of
+unit-conversion quirks it had to get right), or use the GUI's **Export
+VBO** tab instead.
+
 ## How the signals were found
 
 See [`docs/FINDINGS.md`](docs/FINDINGS.md) for the full reference: every
@@ -268,6 +340,33 @@ needs those).
 
 No internet connection involved anywhere in this -- the page and all its
 code are served directly from the ESP32's flash.
+
+### Optional: GPS logging
+
+Wire a **Beitian GN-880/BN-880 GPS module** (cheap, common, NMEA 0183 at
+9600 baud) to the board's free P1 header:
+
+| GN-880/BN-880 pin | ESP32 pin |
+|---|---|
+| TX | GPIO1 (ESP32 RX) |
+| RX | GPIO2 (ESP32 TX) |
+| VCC | 3V3 |
+| GND | GND |
+
+Flash `firmware/esp32_gps_test/esp32_gps_test.ino` first to confirm the
+wiring and baud rate (it just relays raw NMEA sentences to your serial
+monitor) before relying on it -- a fix can take a minute or two outdoors
+with a clear view of the sky. Once that works, `esp32_web_logger.ino`
+picks it up automatically: no extra setup, no config flag. Its first
+valid fix also sets the board's wall clock (used for the web UI's log
+filenames), so GPS logging works without ever opening the web page on a
+device with the right time.
+
+With GPS wired in, recorded CSVs gain `gps_lat`, `gps_lon`, `gps_speed`,
+and `gps_valid` columns -- which is what unlocks the [GPS track map
+overlay](#gps-track-map-overlay) and the [VBO lap-analysis
+export](#lap-analysis-export-vbo) below. Without it, everything else in
+this toolkit works exactly the same, just without those two features.
 
 ## License
 

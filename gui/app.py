@@ -39,7 +39,7 @@ def list_configs():
 class RenderGUI:
     def __init__(self, root):
         self.root = root
-        root.title("HUD Overlay Renderer")
+        root.title("Mazda3 Telemetry Toolkit")
 
         self.csv_path = StringVar()
         self.config_path = StringVar()
